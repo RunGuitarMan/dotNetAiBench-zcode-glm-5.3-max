@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Motiva API
-  version: 1.1.0
+  version: 1.2.0
   description: |
     Мотивационные кампании Motiva, этап 2 (контракт, реализация отсутствует). Ревизия после H1.
     Соглашения:
@@ -402,7 +402,8 @@ paths:
         '428': {$ref: '#/components/responses/PreconditionRequired'}
     delete:
       tags: [Campaigns]
-      summary: Удалить черновик целиком (владелец/Admin); не-черновик — 409
+      summary: 'Удалить черновик кампании (владелец/Admin); не-черновик — 409'
+      description: 'Настройки (стримы, задания, вехи, челленджи, теги, набор ресурсов) удаляются; проведённые операции (в т.ч. выделения бюджета), номера и аудит сохраняются со ссылкой на надгробие кампании — финансовая история не каскадится.'
       parameters:
         - $ref: '#/components/parameters/ifMatch'
       responses:
@@ -420,9 +421,12 @@ paths:
       tags: [Campaigns]
       summary: Назначить/сменить владельца кампании (только Admin)
       description: |
-        Назначение владельца — полномочие администратора (B03.5, A2-04); владелец не может
+        Назначение владельца — полномочие администратора (B03.5); владелец не может
         переназначить владельца через PATCH кампании. Смена действует для новых обращений
         сразу после сохранения (B05.1). Кандидат — действующий сотрудник компании.
+        ETag-договор: применимый strong ETag берётся из GET /campaigns/{id}; сервер сравнивает
+        его с версией агрегата кампании (campaigns.version), проверка и инкремент версии
+        атомарны под блокировкой строки кампании; новый ETag возвращается в ответе.
       parameters:
         - $ref: '#/components/parameters/ifMatch'
       requestBody:
@@ -474,9 +478,11 @@ paths:
       tags: [Campaigns]
       summary: Задать набор ресурсов кампании (владелец/Admin; только черновик)
       description: |
-        Владелец выбирает ресурсы своей кампании штатным API (B08, A2-01). Разрешён только
+        Владелец выбирает ресурсы своей кампании штатным API (B08). Разрешён только
         Draft-статус — после публикации набор неизменяем (B09.5); каждый ресурс — активный
         ресурс той же компании; награды заданий при сохранении должны ссылаться на ресурсы из набора.
+        ETag-договор: как у PUT /campaigns/{id}/owner — strong ETag из GET /campaigns/{id}
+        (версия агрегата кампании), атомарная проверка If-Match и инкремент, новый ETag в ответе.
       parameters:
         - $ref: '#/components/parameters/ifMatch'
       requestBody:
@@ -664,7 +670,7 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
     patch:
       tags: [Campaigns]
-      summary: Настроить задание, включая его аудиторию (до публикации) или архивировать
+      summary: 'Настроить задание: name/description/audience — в любом статусе кроме архива; экономические поля (goal, period, streamPoints, rewardItems, код) — только до публикации'
       parameters:
         - $ref: '#/components/parameters/ifMatch'
       requestBody:
@@ -894,7 +900,7 @@ paths:
     post:
       tags: [Budgets]
       summary: Выделить/увеличить бюджет (Admin); защищено номером операции
-      description: 'Ресурс обязан входить в набор кампании. Повтор номера: те же существенные данные — исходное представление (201); иные — 409; текущая авторизация проверяется первой.'
+      description: 'Существенные данные: campaignId (из URL), resourceId, amount, reason; ресурс обязан входить в набор кампании. Повтор номера: те же данные — исходный статус и сохранённое представление (бессрочно); иные — 409; кампания в область уникальности номера не входит; текущая авторизация проверяется первой.'
       requestBody:
         required: true
         content:
@@ -1020,7 +1026,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/ifMatch'
       responses:
-        '204': {description: Отозвано, история сохранена}
+        '204': {description: 'Отозвано, история сохранена'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -1117,14 +1123,18 @@ paths:
       tags: [Progress]
       summary: Передать событие прогресса (интеграция с действующим grant Progress)
       description: |
-        Порядок обработки: (1) текущая авторизация — подписанный токен, тенант, действующий
-        grant на кампанию задания; отказ 401/403 происходит без любых эффектов и не создаёт
-        запись события; (2) номер события (уникален в компании+источнике бессрочно): новый —
-        обработка, результат Accepted или Rejected (бизнес-отказ сохраняется и по умолчанию
-        занимает номер, AMB-08); тот же номер + те же masterId/taskId/дельта — исходный статус
-        (201) и исходное представление без новых последствий; тот же номер с иными данными —
-        409. Неверные данные (дельта ≤ 0, несуществующие объекты) — 400/404 без записи.
-        creditedDelta может быть 0 (B15.3).
+        Порядок обработки: (1) проверенная идентичность и компания; (2) действующий grant
+        Progress на кампанию задания и обязательные проверки активности — отказ 401/403
+        без любых эффектов и без записи; (3) номер события (уникален company + проверенный
+        subject + eventNumber, бессрочно, кампания в ключ не входит): новый — обработка
+        (Accepted или Rejected; отказ сохраняется как результат — B16.2, номер освобождается
+        только для неверных данных — B16.5); тот же номер + те же существенные данные
+        (masterId, taskId, переданная дельта; порядок JSON не важен) — исходный HTTP-статус
+        и исходное сохранённое представление (completion остаётся null, если завершения
+        не было на момент обработки); тот же номер с иными данными — 409. (4) Бизнес-предусловия —
+        только для нового события; для найденного период/аудитория/архив/сроки/награда заново
+        не вычисляются (B16.4). creditedDelta может быть 0 (B15.3). acceptedAt назначается
+        по протоколу этапа 2 (время после захвата замков челленджей).
       requestBody:
         required: true
         content:
@@ -1146,7 +1156,7 @@ paths:
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
     get:
       tags: [Progress]
-      summary: История событий (Admin)
+      summary: История событий компании (Admin); представление самодостаточно при completion=null
       parameters:
         - $ref: '#/components/parameters/limit'
         - $ref: '#/components/parameters/cursor'
@@ -1172,7 +1182,7 @@ paths:
     post:
       tags: [Economic]
       summary: 'Трата с кошелька (сотрудник — своя; система покупок — с grant Spend: ресурс+система)'
-      description: 'Повтор номера: те же существенные данные (получатель, система, ресурс, сумма) — исходное представление; иные — 409; авторизация первой. Существенные данные изменения не создают ресурс операции.'
+      description: 'Повтор номера: существенные данные траты — masterId, purchaseSystemId, resourceId, amount; те же — исходный статус и сохранённое представление (бессрочно); иные — 409; авторизация первой, ошибка доступа ничего не создаёт. Заблокированный получатель новой траты — 201 Declined RecipientNotActive.'
       requestBody:
         required: true
         content:
@@ -1196,7 +1206,7 @@ paths:
     post:
       tags: [Economic]
       summary: 'Ручное начисление (владелец/Admin; интеграция — grant Award: кампания+ресурс)'
-      description: 'Повтор номера: те же существенные данные (получатель, ресурс, сумма) — исходное представление; иные — 409; авторизация первой.'
+      description: 'Повтор номера: существенные данные — campaignId (из URL), masterId, resourceId, amount, reason; те же — исходный статус и сохранённое представление (бессрочно); иные — 409; авторизация первой.'
       parameters:
         - $ref: '#/components/parameters/uuidId'
       requestBody:
@@ -1222,7 +1232,7 @@ paths:
     post:
       tags: [Economic]
       summary: Полная отмена (Admin; текущий владелец кампании-источника — начисления; система покупок — свои траты при grant Spend)
-      description: 'Повтор номера: те же существенные данные (оригинал) — исходное представление; иные — 409; авторизация первой. Отказы — экономические (201 Declined): InsufficientBalance, OriginalAlreadyReversed, OriginalNotPosted.'
+      description: 'Повтор номера: существенные данные — originalOperationId, reason; те же — исходный статус и сохранённое представление (бессрочно); иные — 409; авторизация первой. Отказы — экономические (201 Declined): InsufficientBalance, OriginalAlreadyReversed, OriginalNotPosted. Активность получателя для коррекции не требуется: Admin-коррекция заблокированного кошелька разрешена (B26–B27); владельцу и системе покупок при заблокированном получателе до решения AMB-02/03 возвращается 403.'
       requestBody:
         required: true
         content:
@@ -1261,8 +1271,11 @@ paths:
       summary: Своя история операций (user — кошелька; service — инициированных субъектом)
       description: |
         Для сотрудника — операции его кошелька, включая отклонённые (B22.3).
-        Для service-субъекта (система покупок) — только операции, инициатором которых он
-        является: собственная история операций, но не весь кошелёк сотрудника (B04.3, A2-03).
+        Для service-субъекта (система покупок) цепочка: проверенный JWT subject → действующий
+        grant → конкретные purchaseSystemId и resourceId → только операции, инициатором
+        которых он является; subject ≠ purchaseSystemId, владение одной системой не даёт
+        весь кошелёк сотрудника (B04.3).
+        Повторы защищены номерами операций (бессрочно, сохранённый исходный ответ).
       parameters:
         - $ref: '#/components/parameters/limit'
         - $ref: '#/components/parameters/cursor'
@@ -1313,6 +1326,39 @@ paths:
                   items:
                     type: array
                     items: {$ref: '#/components/schemas/AchievementGrant'}
+                  nextCursor: {$ref: '#/components/schemas/Cursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /me/progress-events:
+    get:
+      tags: [Progress]
+      summary: Собственная история выполнения (сотрудник из проверенного токена)
+      description: |
+        Прошлые периоды и сезоны, включая частичный прогресс, завершения и решения о награде
+        с причинами отказов. Доступ сохраняется после потери аудитории (B11.6) и архива
+        кампании. Историей не подменяет текущее состояние (/me/campaigns/{id}/progress).
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/cursor'
+        - $ref: '#/components/parameters/from'
+        - $ref: '#/components/parameters/to'
+        - name: campaignId
+          in: query
+          schema: {type: string, format: uuid}
+        - name: taskId
+          in: query
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: 'Порядок acceptedAt, id; keyset-курсор append-only истории'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/ProgressEventResult'}
                   nextCursor: {$ref: '#/components/schemas/Cursor'}
         '401': {$ref: '#/components/responses/Unauthorized'}
   /me/campaigns/{id}/progress:
@@ -1429,12 +1475,16 @@ paths:
       - $ref: '#/components/parameters/uuidId'
     get:
       tags: [Leaderboards]
-      summary: Рейтинг соревнования (top N; аудитория, после финала — участники/владелец/Admin)
+      summary: 'Рейтинг соревнования (top N; текущая аудитория — до конца сезона, после сезона — участники/владелец/Admin)'
       description: |
         Соревновательное ранжирование: 100, 100, 90 → места 1, 1, 3; равные строки — по
         возрастанию masterId. Состав данных — только masterId, счёт, место (B32.4).
-        state=Live — актуальный счёт, now − asOfUtc ≤ 5 с; state=Final — неизменяемые итоги,
-        asOfUtc = момент финализации.
+        Граница доступа — «после сезона» (B32.5), а не «после финала»: Final — состояние
+        результата, не основание досрочно менять права чтения; собственное историческое
+        участие проверяется по сохранённым challenge_results.
+        state=Live — актуальный счёт, now − asOfUtc ≤ 5 с; Final — неизменяемые итоги,
+        asOfUtc = момент финализации. Live-рейтинг — top N (limit), cursor-обход всей
+        коллекции не обещается (T04).
       parameters:
         - $ref: '#/components/parameters/limit'
       responses:
@@ -1555,7 +1605,7 @@ paths:
       tags: [Exports]
       summary: Удалить выписку (заказчик); без If-Match
       responses:
-        '204': {description: Удалена; новые ссылки не выдаются, история запроса остаётся}
+        '204': {description: 'Удалена; новые ссылки не выдаются, история запроса остаётся'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -1928,6 +1978,7 @@ components:
         audience: {$ref: '#/components/schemas/Audience'}
     TaskPatch:
       type: object
+      description: 'После публикации изменяемы name/description/audience и архивация (B09.5 не запрещает); goal/period/streamPoints/rewardItems — только в черновике, иначе 409'
       minProperties: 1
       properties:
         name: {type: string, minLength: 1, maxLength: 200}
@@ -2000,7 +2051,7 @@ components:
       type: string
       nullable: true
       enum: [InsufficientBudget, InsufficientFunds, InsufficientBalance, ResourceUnavailable,
-             RecipientNotActive, RecipientNotInAudience, OriginalAlreadyReversed, OriginalNotPosted]
+             RecipientNotActive, RecipientNotInAudience, OriginalAlreadyReversed, OriginalNotPosted, null]
     OperationItem:
       type: object
       required: [resourceId, resourceCode, amount, direction]
@@ -2086,9 +2137,24 @@ components:
         streamPointsAdded: {type: integer, format: int64, minimum: 0}
         reward: {$ref: '#/components/schemas/RewardDecision'}
         completedAtUtc: {type: string, format: date-time}
+    CompletionInfoNullable:
+      type: object
+      nullable: true
+      description: 'Nullable-вариант CompletionInfo: собственные ограничения продублированы, $ref+nullable в OAS 3.0.3 не работает'
+      required: [taskId, periodStart, streamPointsAdded, reward, completedAtUtc]
+      properties:
+        taskId: {type: string, format: uuid}
+        periodStart: {type: string, format: date-time}
+        streamPointsAdded: {type: integer, format: int64, minimum: 0}
+        reward: {$ref: '#/components/schemas/RewardDecision'}
+        completedAtUtc: {type: string, format: date-time}
     ProgressEventResult:
       type: object
-      required: [id, eventNumber, result, transmittedDelta, creditedDelta, acceptedAtUtc]
+      description: |
+        Самодостаточен при completion=null: masterId, taskId и период идентифицируют событие
+        без завершения. Повтор номера события возвращает это же сохранённое представление
+        (completion остаётся null, если завершения не было на момент обработки).
+      required: [id, eventNumber, result, masterId, taskId, transmittedDelta, creditedDelta, acceptedAtUtc]
       properties:
         id: {type: string, format: uuid}
         eventNumber: {$ref: '#/components/schemas/ExternalNumber'}
@@ -2096,11 +2162,18 @@ components:
         rejectReason:
           type: string
           nullable: true
-          enum: [EmployeeNotActive, AudienceMismatch, CampaignClosed, TargetArchived]
+          enum: [EmployeeNotActive, AudienceMismatch, CampaignClosed, TargetArchived, null]
+        masterId: {type: integer, format: int32}
+        taskId: {type: string, format: uuid}
+        periodStartUtc:
+          type: string
+          format: date-time
+          nullable: true
+          description: Период принятого события; null для Rejected
         transmittedDelta: {type: integer, format: int64, minimum: 1}
         creditedDelta: {type: integer, format: int64, minimum: 0}
         acceptedAtUtc: {type: string, format: date-time}
-        completion: {$ref: '#/components/schemas/CompletionInfo', nullable: true}
+        completion: {$ref: '#/components/schemas/CompletionInfoNullable'}
     WalletBalance:
       type: object
       required: [resourceId, resourceCode, balance, resourceStatus]
@@ -2192,11 +2265,13 @@ components:
         asOfUtc: {type: string, format: date-time}
     LeaderboardMe:
       type: object
-      required: [masterId, score, place, state, asOfUtc]
+      description: 'При отсутствии участия: participating=false, score=null, place=null — без выдуманного нулевого участника или места'
+      required: [masterId, participating, state, asOfUtc]
       properties:
         masterId: {type: integer, format: int32}
-        score: {type: integer, format: int64, minimum: 0}
-        place: {type: integer, format: int32, minimum: 1}
+        participating: {type: boolean}
+        score: {type: integer, format: int64, minimum: 0, nullable: true}
+        place: {type: integer, format: int32, minimum: 1, nullable: true}
         state: {type: string, enum: [Live, Final]}
         asOfUtc: {type: string, format: date-time}
     IntegrationGrant:
@@ -2309,7 +2384,7 @@ components:
       required: [id, url, expiresAtUtc]
       properties:
         id: {type: string, format: uuid}
-        url: {type: string, description: Приватный S3, срок ≤ 60 с}
+        url: {type: string, description: 'Приватный S3, срок ≤ 60 с'}
         expiresAtUtc: {type: string, format: date-time}
     AuditRecord:
       type: object
