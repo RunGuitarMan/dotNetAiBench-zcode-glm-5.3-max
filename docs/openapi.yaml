@@ -1,14 +1,22 @@
 openapi: 3.0.3
 info:
   title: Motiva API
-  version: 1.0.0
+  version: 1.1.0
   description: |
-    Мотивационные кампании Motiva, этап 2 (контракт, реализация отсутствует).
-    Соглашения: экономический отказ корректно сформированной операции — 201 с result=Declined
-    (то же представление, что Posted); доступ/валидация — 4xx без создания ресурса операции.
-    Бизнес-номера (progress events, операции B24) бессрочны и не требуют Idempotency-Key;
-    остальные создающие POST требуют заголовок Idempotency-Key. Изменяемые настройки
-    защищены strong ETag + If-Match. Списки: items + nextCursor, limit 1..100 (default 50).
+    Мотивационные кампании Motiva, этап 2 (контракт, реализация отсутствует). Ревизия после H1.
+    Соглашения:
+    - Экономический отказ корректно сформированной операции — 201 с result=Declined (то же
+      представление, что Posted); ошибки доступа/валидации — 4xx без создания ресурса операции.
+    - Порядок обработки любого повтора: текущая авторизация проверяется первой (401/403 —
+      без эффектов, ошибка доступа не создаёт бизнес-операцию и не превращается в сохранённый
+      успех); далее номер: тот же номер + те же существенные данные — исходный статус и
+      представление; иные существенные данные — 409.
+    - Бизнес-номера (progress events, операции B24) бессрочны и не требуют Idempotency-Key;
+      остальные создающие POST требуют Idempotency-Key (scope: company + инициатор + операция/цель + ключ).
+    - Все операции изменения настроек (PATCH/PUT/DELETE) требуют If-Match; ETag доступен
+      через GET объекта (strong). Экономические операции и удаление выписки If-Match не используют.
+    - Все списки: items + nextCursor, limit 1..100 (default 50); кешируемые неперсональные
+      каталоги несут обязательный asOfUtc (допуск 30 с; live-рейтинг 5 с).
 servers:
   - url: http://localhost:8080/api/v1
     description: Локальный стенд
@@ -123,7 +131,7 @@ paths:
   /resources:
     get:
       tags: [Resources]
-      summary: Каталог ресурсов компании
+      summary: Каталог ресурсов компании (кешируемый, asOfUtc обязателен)
       parameters:
         - $ref: '#/components/parameters/limit'
         - $ref: '#/components/parameters/cursor'
@@ -132,17 +140,18 @@ paths:
           schema: {type: string, enum: [Active, Archived]}
       responses:
         '200':
-          description: Порядок по коду; кешируется (asOf в заголовке Date)
+          description: 'Порядок по коду; now − asOfUtc ≤ 30 с'
           content:
             application/json:
               schema:
                 type: object
-                required: [items]
+                required: [items, asOfUtc]
                 properties:
                   items:
                     type: array
                     items: {$ref: '#/components/schemas/Resource'}
                   nextCursor: {$ref: '#/components/schemas/Cursor'}
+                  asOfUtc: {type: string, format: date-time}
         '401': {$ref: '#/components/responses/Unauthorized'}
     post:
       tags: [Resources]
@@ -211,23 +220,24 @@ paths:
   /achievements:
     get:
       tags: [Achievements]
-      summary: Определения достижений
+      summary: Определения достижений (кешируемый, asOfUtc обязателен)
       parameters:
         - $ref: '#/components/parameters/limit'
         - $ref: '#/components/parameters/cursor'
       responses:
         '200':
-          description: Порядок по коду
+          description: 'Порядок по коду; now − asOfUtc ≤ 30 с'
           content:
             application/json:
               schema:
                 type: object
-                required: [items]
+                required: [items, asOfUtc]
                 properties:
                   items:
                     type: array
                     items: {$ref: '#/components/schemas/Achievement'}
                   nextCursor: {$ref: '#/components/schemas/Cursor'}
+                  asOfUtc: {type: string, format: date-time}
         '401': {$ref: '#/components/responses/Unauthorized'}
     post:
       tags: [Achievements]
@@ -307,17 +317,18 @@ paths:
           schema: {type: string, enum: [Draft, Published, Archived]}
       responses:
         '200':
-          description: Порядок по коду
+          description: 'Порядок по коду; now − asOfUtc ≤ 30 с'
           content:
             application/json:
               schema:
                 type: object
-                required: [items]
+                required: [items, asOfUtc]
                 properties:
                   items:
                     type: array
                     items: {$ref: '#/components/schemas/Campaign'}
                   nextCursor: {$ref: '#/components/schemas/Cursor'}
+                  asOfUtc: {type: string, format: date-time}
         '401': {$ref: '#/components/responses/Unauthorized'}
     post:
       tags: [Campaigns]
@@ -360,10 +371,12 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
     patch:
       tags: [Campaigns]
-      summary: Настроить или перевести в Published/Archived (владелец/Admin)
+      summary: Настроить кампанию или перевести в Published/Archived (владелец/Admin)
       description: |
-        После публикации изменяемы name/description/audience/ownerMasterId и архивация;
-        сезон, сроки, состав заданий, цели, периодичность, награды, очки, правила рейтинга — 409.
+        Владелец своей кампании и Admin изменяют name/description/audience и статус.
+        Смена владельца — отдельное полномочие Admin: PUT /campaigns/{id}/owner.
+        После публикации неизменяемы сезон, сроки, состав заданий/ресурсов, цели,
+        периодичность, награды, очки, правила рейтинга — 409.
         status=Published запускает проверку состава (B09.4); провал — 409 conflict.publish-check.
       parameters:
         - $ref: '#/components/parameters/ifMatch'
@@ -400,16 +413,50 @@ paths:
         '409': {$ref: '#/components/responses/Conflict'}
         '412': {$ref: '#/components/responses/PreconditionFailed'}
         '428': {$ref: '#/components/responses/PreconditionRequired'}
-
-  /campaigns/{id}/streams:
+  /campaigns/{id}/owner:
+    parameters:
+      - $ref: '#/components/parameters/uuidId'
+    put:
+      tags: [Campaigns]
+      summary: Назначить/сменить владельца кампании (только Admin)
+      description: |
+        Назначение владельца — полномочие администратора (B03.5, A2-04); владелец не может
+        переназначить владельца через PATCH кампании. Смена действует для новых обращений
+        сразу после сохранения (B05.1). Кандидат — действующий сотрудник компании.
+      parameters:
+        - $ref: '#/components/parameters/ifMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CampaignOwnerPut'}
+      responses:
+        '200':
+          headers:
+            ETag: {schema: {type: string}}
+          description: Владелец назначен
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Campaign'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '412': {$ref: '#/components/responses/PreconditionFailed'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+  /campaigns/{id}/resources:
     parameters:
       - $ref: '#/components/parameters/uuidId'
     get:
       tags: [Campaigns]
-      summary: Стримы кампании
+      summary: Набор ресурсов кампании (владелец/Admin)
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/cursor'
       responses:
         '200':
-          description: Порядок по коду
+          description: Порядок по коду ресурса
           content:
             application/json:
               schema:
@@ -418,7 +465,70 @@ paths:
                 properties:
                   items:
                     type: array
+                    items: {$ref: '#/components/schemas/CampaignResource'}
+                  nextCursor: {$ref: '#/components/schemas/Cursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    put:
+      tags: [Campaigns]
+      summary: Задать набор ресурсов кампании (владелец/Admin; только черновик)
+      description: |
+        Владелец выбирает ресурсы своей кампании штатным API (B08, A2-01). Разрешён только
+        Draft-статус — после публикации набор неизменяем (B09.5); каждый ресурс — активный
+        ресурс той же компании; награды заданий при сохранении должны ссылаться на ресурсы из набора.
+      parameters:
+        - $ref: '#/components/parameters/ifMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CampaignResourcesPut'}
+      responses:
+        '200':
+          headers:
+            ETag: {schema: {type: string}}
+          description: Набор установлен (полная замена списка)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/CampaignResource'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '412': {$ref: '#/components/responses/PreconditionFailed'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+
+  /campaigns/{id}/streams:
+    parameters:
+      - $ref: '#/components/parameters/uuidId'
+    get:
+      tags: [Campaigns]
+      summary: Стримы кампании (аудитория опубликованной кампании, владелец, Admin)
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/cursor'
+      responses:
+        '200':
+          description: 'Порядок по коду; now − asOfUtc ≤ 30 с'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, asOfUtc]
+                properties:
+                  items:
+                    type: array
                     items: {$ref: '#/components/schemas/Stream'}
+                  nextCursor: {$ref: '#/components/schemas/Cursor'}
+                  asOfUtc: {type: string, format: date-time}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -491,20 +601,27 @@ paths:
       - $ref: '#/components/parameters/uuidId'
     get:
       tags: [Campaigns]
-      summary: Задания стрима
+      summary: Задания стрима — доступные задания для сотрудника (аудитория, владелец, Admin)
+      description: Аудитория задания задаётся независимо и проверяется совместно с аудиторией кампании (B11).
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/cursor'
       responses:
         '200':
-          description: Порядок по коду
+          description: 'Порядок по коду; now − asOfUtc ≤ 30 с'
           content:
             application/json:
               schema:
                 type: object
-                required: [items]
+                required: [items, asOfUtc]
                 properties:
                   items:
                     type: array
                     items: {$ref: '#/components/schemas/Task'}
+                  nextCursor: {$ref: '#/components/schemas/Cursor'}
+                  asOfUtc: {type: string, format: date-time}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
     post:
       tags: [Campaigns]
@@ -547,7 +664,7 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
     patch:
       tags: [Campaigns]
-      summary: Настроить задание (до публикации) или архивировать
+      summary: Настроить задание, включая его аудиторию (до публикации) или архивировать
       parameters:
         - $ref: '#/components/parameters/ifMatch'
       requestBody:
@@ -576,6 +693,9 @@ paths:
     get:
       tags: [Campaigns]
       summary: Вехи стрима
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/cursor'
       responses:
         '200':
           description: Порядок по порогу
@@ -588,6 +708,7 @@ paths:
                   items:
                     type: array
                     items: {$ref: '#/components/schemas/Milestone'}
+                  nextCursor: {$ref: '#/components/schemas/Cursor'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '404': {$ref: '#/components/responses/NotFound'}
     post:
@@ -616,6 +737,19 @@ paths:
   /milestones/{id}:
     parameters:
       - $ref: '#/components/parameters/uuidId'
+    get:
+      tags: [Campaigns]
+      summary: Веха (источник strong ETag для If-Match при удалении)
+      responses:
+        '200':
+          headers:
+            ETag: {schema: {type: string}}
+          description: С strong ETag
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Milestone'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
     delete:
       tags: [Campaigns]
       summary: Удалить веху (только черновик, иначе 409; владелец/Admin)
@@ -635,6 +769,9 @@ paths:
     get:
       tags: [Campaigns]
       summary: Челленджи кампании
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/cursor'
       responses:
         '200':
           description: Порядок по startsAt
@@ -647,6 +784,7 @@ paths:
                   items:
                     type: array
                     items: {$ref: '#/components/schemas/Challenge'}
+                  nextCursor: {$ref: '#/components/schemas/Cursor'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -678,9 +816,11 @@ paths:
       - $ref: '#/components/parameters/uuidId'
     get:
       tags: [Campaigns]
-      summary: Челлендж
+      summary: Челлендж (с strong ETag для If-Match при удалении черновика)
       responses:
         '200':
+          headers:
+            ETag: {schema: {type: string}}
           description: Данные соревнования
           content:
             application/json:
@@ -706,10 +846,13 @@ paths:
       - $ref: '#/components/parameters/uuidId'
     get:
       tags: [Budgets]
-      summary: Остатки бюджетов по ресурсам (владелец/Admin)
+      summary: Остатки бюджетов по ресурсам набора кампании (владелец/Admin)
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/cursor'
       responses:
         '200':
-          description: available = выделения − проведённые начисления + отмены
+          description: available = выделения − проведённые начисления + отмены; порядок по коду ресурса
           content:
             application/json:
               schema:
@@ -719,6 +862,7 @@ paths:
                   items:
                     type: array
                     items: {$ref: '#/components/schemas/BudgetBalance'}
+                  nextCursor: {$ref: '#/components/schemas/Cursor'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -749,7 +893,8 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
     post:
       tags: [Budgets]
-      summary: Выделить/увеличить бюджет (Admin); защищено номером операции, не Idempotency-Key
+      summary: Выделить/увеличить бюджет (Admin); защищено номером операции
+      description: 'Ресурс обязан входить в набор кампании. Повтор номера: те же существенные данные — исходное представление (201); иные — 409; текущая авторизация проверяется первой.'
       requestBody:
         required: true
         content:
@@ -759,7 +904,7 @@ paths:
         '201':
           headers:
             Location: {schema: {type: string}}
-          description: Проведено (result=Posted); повтор номера с теми же данными — то же представление
+          description: Проведено (result=Posted)
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Operation'}
@@ -769,6 +914,36 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /campaigns/{id}/progress:
+    parameters:
+      - $ref: '#/components/parameters/uuidId'
+    get:
+      tags: [Progress]
+      summary: Прогресс участников кампании (владелец/Admin; B03, B34)
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/cursor'
+        - name: streamId
+          in: query
+          description: Ограничить одним стримом
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: 'Порядок masterId по возрастанию; для каждого участника — очки стримов, задания текущих периодов, вехи'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/ParticipantProgress'}
+                  nextCursor: {$ref: '#/components/schemas/Cursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
 
   /integration-grants:
     get:
@@ -797,7 +972,12 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
     post:
       tags: [IntegrationGrants]
-      summary: Выдать разрешение (Admin)
+      summary: Выдать разрешение (Admin) со строгим сочетанием цели
+      description: |
+        Допустимые сочетания (B04, A2-05): Progress → campaignId;
+        Award → campaignId + resourceId (ресурс из набора кампании);
+        Spend → resourceId + purchaseSystemId. Иные поля в каждом варианте запрещены;
+        неполные/недопустимые — 400 validation.grant-target.
       parameters:
         - $ref: '#/components/parameters/idempotencyKey'
       requestBody:
@@ -820,14 +1000,32 @@ paths:
   /integration-grants/{id}:
     parameters:
       - $ref: '#/components/parameters/uuidId'
+    get:
+      tags: [IntegrationGrants]
+      summary: Разрешение (источник strong ETag для If-Match при отзыве)
+      responses:
+        '200':
+          headers:
+            ETag: {schema: {type: string}}
+          description: С strong ETag
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/IntegrationGrant'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
     delete:
       tags: [IntegrationGrants]
       summary: Отозвать разрешение (Admin); действует для новых обращений сразу
+      parameters:
+        - $ref: '#/components/parameters/ifMatch'
       responses:
         '204': {description: Отозвано, история сохранена}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '412': {$ref: '#/components/responses/PreconditionFailed'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
 
   /purchase-systems:
     get:
@@ -917,12 +1115,16 @@ paths:
   /progress-events:
     post:
       tags: [Progress]
-      summary: Передать событие прогресса (интеграция с grant Progress)
+      summary: Передать событие прогресса (интеграция с действующим grant Progress)
       description: |
-        Номер события уникален в компании+источнике бессрочно. Повтор с теми же данными
-        возвращает сохранённый результат без новых последствий; расхождение сотрудник/задание/
-        увеличение — 409. Бизнес-отказ (неактивен, не в аудитории, вне сроков, архив)
-        сохраняется как result=Rejected (по умолчанию занимает номер, AMB-08). Неверные данные — 400 без записи.
+        Порядок обработки: (1) текущая авторизация — подписанный токен, тенант, действующий
+        grant на кампанию задания; отказ 401/403 происходит без любых эффектов и не создаёт
+        запись события; (2) номер события (уникален в компании+источнике бессрочно): новый —
+        обработка, результат Accepted или Rejected (бизнес-отказ сохраняется и по умолчанию
+        занимает номер, AMB-08); тот же номер + те же masterId/taskId/дельта — исходный статус
+        (201) и исходное представление без новых последствий; тот же номер с иными данными —
+        409. Неверные данные (дельта ≤ 0, несуществующие объекты) — 400/404 без записи.
+        creditedDelta может быть 0 (B15.3).
       requestBody:
         required: true
         content:
@@ -932,7 +1134,7 @@ paths:
         '201':
           headers:
             Location: {schema: {type: string}}
-          description: Обработано (Accepted или Rejected); creditedDelta может быть 0
+          description: Обработано или возвращён сохранённый результат повтора
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ProgressEventResult'}
@@ -948,12 +1150,8 @@ paths:
       parameters:
         - $ref: '#/components/parameters/limit'
         - $ref: '#/components/parameters/cursor'
-        - name: from
-          in: query
-          schema: {type: string, format: date-time}
-        - name: to
-          in: query
-          schema: {type: string, format: date-time}
+        - $ref: '#/components/parameters/from'
+        - $ref: '#/components/parameters/to'
       responses:
         '200':
           description: Порядок acceptedAt, id
@@ -973,7 +1171,8 @@ paths:
   /spends:
     post:
       tags: [Economic]
-      summary: Трата с кошелька (сотрудник — своя; система покупок — с grant Spend)
+      summary: 'Трата с кошелька (сотрудник — своя; система покупок — с grant Spend: ресурс+система)'
+      description: 'Повтор номера: те же существенные данные (получатель, система, ресурс, сумма) — исходное представление; иные — 409; авторизация первой. Существенные данные изменения не создают ресурс операции.'
       requestBody:
         required: true
         content:
@@ -996,7 +1195,8 @@ paths:
   /campaigns/{id}/manual-awards:
     post:
       tags: [Economic]
-      summary: Ручное начисление (владелец/Admin; интеграция — grant Award)
+      summary: 'Ручное начисление (владелец/Admin; интеграция — grant Award: кампания+ресурс)'
+      description: 'Повтор номера: те же существенные данные (получатель, ресурс, сумма) — исходное представление; иные — 409; авторизация первой.'
       parameters:
         - $ref: '#/components/parameters/uuidId'
       requestBody:
@@ -1021,7 +1221,8 @@ paths:
   /reversals:
     post:
       tags: [Economic]
-      summary: Полная отмена операции (Admin; владелец — начисления своей кампании; система покупок — свои траты)
+      summary: Полная отмена (Admin; текущий владелец кампании-источника — начисления; система покупок — свои траты при grant Spend)
+      description: 'Повтор номера: те же существенные данные (оригинал) — исходное представление; иные — 409; авторизация первой. Отказы — экономические (201 Declined): InsufficientBalance, OriginalAlreadyReversed, OriginalNotPosted.'
       requestBody:
         required: true
         content:
@@ -1031,7 +1232,7 @@ paths:
         '201':
           headers:
             Location: {schema: {type: string}}
-          description: result=Posted или Declined (InsufficientBalance/OriginalAlreadyReversed/OriginalNotPosted)
+          description: result=Posted или Declined
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Operation'}
@@ -1057,7 +1258,11 @@ paths:
   /me/operations:
     get:
       tags: [Operations]
-      summary: Своя история операций, включая отклонённые
+      summary: Своя история операций (user — кошелька; service — инициированных субъектом)
+      description: |
+        Для сотрудника — операции его кошелька, включая отклонённые (B22.3).
+        Для service-субъекта (система покупок) — только операции, инициатором которых он
+        является: собственная история операций, но не весь кошелёк сотрудника (B04.3, A2-03).
       parameters:
         - $ref: '#/components/parameters/limit'
         - $ref: '#/components/parameters/cursor'
@@ -1225,11 +1430,16 @@ paths:
     get:
       tags: [Leaderboards]
       summary: Рейтинг соревнования (top N; аудитория, после финала — участники/владелец/Admin)
+      description: |
+        Соревновательное ранжирование: 100, 100, 90 → места 1, 1, 3; равные строки — по
+        возрастанию masterId. Состав данных — только masterId, счёт, место (B32.4).
+        state=Live — актуальный счёт, now − asOfUtc ≤ 5 с; state=Final — неизменяемые итоги,
+        asOfUtc = момент финализации.
       parameters:
         - $ref: '#/components/parameters/limit'
       responses:
         '200':
-          description: Только masterId, счёт, место; state Live/Float из БД, Final из итогов
+          description: Top N рейтинга
           content:
             application/json:
               schema: {$ref: '#/components/schemas/LeaderboardPage'}
@@ -1355,13 +1565,14 @@ paths:
     post:
       tags: [Exports]
       summary: Выдать ссылку на скачивание (≤60 с)
+      description: 'Повтор ключа возвращает ту же, возможно истёкшую ссылку; удалённая выписка — 409 после проверки доступа; новая ссылка — новый ключ.'
       parameters:
         - $ref: '#/components/parameters/idempotencyKey'
       responses:
         '201':
           headers:
             Location: {schema: {type: string}}
-          description: Ссылка на неизменяемые проверенные байты; повтор ключа возвращает ту же ссылку
+          description: Ссылка на неизменяемые проверенные байты
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DownloadLink'}
@@ -1410,7 +1621,7 @@ components:
       name: If-Match
       in: header
       required: true
-      description: Strong ETag из GET; отсутствие — 428, устаревание — 412
+      description: Strong ETag из GET объекта; отсутствие — 428, устаревание — 412
       schema: {type: string}
     idempotencyKey:
       name: Idempotency-Key
@@ -1430,7 +1641,7 @@ components:
       schema: {type: string, format: uuid}
   responses:
     BadRequest:
-      description: Неверные поля/форматы/пределы (validation.*)
+      description: Неверные поля/форматы/пределы/сочетание цели grant (validation.*)
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
@@ -1440,7 +1651,7 @@ components:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
     Forbidden:
-      description: Недостаточно полномочий (authz.forbidden / authz.grant-missing)
+      description: Недостаточно полномочий (authz.forbidden / authz.grant-missing / authz.employee-not-active)
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
@@ -1485,8 +1696,8 @@ components:
         status: {type: integer}
         code:
           type: string
-          enum: [validation.failed, validation.overflow, validation.code-format,
-                 auth.invalid-token, authz.forbidden, authz.grant-missing, not-found,
+          enum: [validation.failed, validation.overflow, validation.code-format, validation.grant-target,
+                 auth.invalid-token, authz.forbidden, authz.grant-missing, authz.employee-not-active, not-found,
                  conflict.business-number, conflict.idempotency-data, conflict.state,
                  conflict.publish-check, precondition.required, precondition.failed,
                  service.unavailable, dependency.unavailable]
@@ -1580,7 +1791,7 @@ components:
         description: {type: string, maxLength: 2000}
     Audience:
       type: object
-      description: 'Пустой набор не ограничивает; none — запрещающие теги'
+      description: 'Аудитория: any/all/none; пустые наборы не ограничивают; none — запрещающие теги'
       properties:
         any:
           type: array
@@ -1620,16 +1831,41 @@ components:
         audience: {$ref: '#/components/schemas/Audience'}
     CampaignPatch:
       type: object
+      description: Смена владельца здесь недоступна — PUT /campaigns/{id}/owner (Admin)
       minProperties: 1
       properties:
         name: {type: string, minLength: 1, maxLength: 200}
         description: {type: string, maxLength: 2000}
-        ownerMasterId: {type: integer, format: int32, minimum: 1}
         audience: {$ref: '#/components/schemas/Audience'}
         status:
           type: string
           enum: [Published, Archived]
-          description: 'Published — с проверкой состава; оба перехода не отменяются'
+          description: 'Published — с проверкой состава; переходы не отменяются'
+    CampaignOwnerPut:
+      type: object
+      required: [masterId]
+      properties:
+        masterId:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Действующий сотрудник компании; неактивный кандидат — 409
+    CampaignResource:
+      type: object
+      required: [resourceId, resourceCode, name, status]
+      properties:
+        resourceId: {type: string, format: uuid}
+        resourceCode: {type: string}
+        name: {type: string}
+        status: {type: string, enum: [Active, Archived]}
+    CampaignResourcesPut:
+      type: object
+      required: [resourceIds]
+      properties:
+        resourceIds:
+          type: array
+          description: Полная замена набора; только активные ресурсы своей компании; только Draft
+          items: {type: string, format: uuid}
     Stream:
       type: object
       required: [id, campaignId, code, name, status]
@@ -1659,7 +1895,7 @@ components:
         amount: {type: integer, format: int64, minimum: 1, maximum: 1000000000}
     Task:
       type: object
-      required: [id, streamId, code, name, goal, period, streamPoints, rewardItems, status]
+      required: [id, streamId, code, name, goal, period, streamPoints, rewardItems, audience, status]
       properties:
         id: {type: string, format: uuid}
         streamId: {type: string, format: uuid}
@@ -1672,6 +1908,9 @@ components:
         rewardItems:
           type: array
           items: {$ref: '#/components/schemas/RewardItem'}
+        audience:
+          $ref: '#/components/schemas/Audience'
+          description: Аудитория задания; проверяется совместно с аудиторией кампании (B11)
         status: {type: string, enum: [Active, Archived]}
     TaskCreate:
       type: object
@@ -1681,11 +1920,12 @@ components:
         name: {type: string, minLength: 1, maxLength: 200}
         description: {type: string, maxLength: 2000}
         goal: {type: integer, format: int64, minimum: 1, maximum: 1000000000}
-        period: {type: string, enum: [Day, Month, Quarter, HalfYear, Year]}
+        period: {type: string, enum: [Day, Quarter, Month, HalfYear, Year]}
         streamPoints: {type: integer, format: int64, minimum: 0, maximum: 1000000000}
         rewardItems:
           type: array
           items: {$ref: '#/components/schemas/RewardItem'}
+        audience: {$ref: '#/components/schemas/Audience'}
     TaskPatch:
       type: object
       minProperties: 1
@@ -1698,6 +1938,7 @@ components:
         rewardItems:
           type: array
           items: {$ref: '#/components/schemas/RewardItem'}
+        audience: {$ref: '#/components/schemas/Audience'}
         status: {type: string, enum: [Archived]}
     Milestone:
       type: object
@@ -1847,7 +2088,7 @@ components:
         completedAtUtc: {type: string, format: date-time}
     ProgressEventResult:
       type: object
-      required: [id, eventNumber, result, transmittedDelta, creditedDelta, acceptedAtUtc, replay]
+      required: [id, eventNumber, result, transmittedDelta, creditedDelta, acceptedAtUtc]
       properties:
         id: {type: string, format: uuid}
         eventNumber: {$ref: '#/components/schemas/ExternalNumber'}
@@ -1859,7 +2100,6 @@ components:
         transmittedDelta: {type: integer, format: int64, minimum: 1}
         creditedDelta: {type: integer, format: int64, minimum: 0}
         acceptedAtUtc: {type: string, format: date-time}
-        replay: {type: boolean, description: true для повтора уже обработанного номера}
         completion: {$ref: '#/components/schemas/CompletionInfo', nullable: true}
     WalletBalance:
       type: object
@@ -1926,6 +2166,14 @@ components:
         streams:
           type: array
           items: {$ref: '#/components/schemas/StreamProgress'}
+    ParticipantProgress:
+      type: object
+      required: [masterId, streams]
+      properties:
+        masterId: {type: integer, format: int32}
+        streams:
+          type: array
+          items: {$ref: '#/components/schemas/StreamProgress'}
     LeaderboardEntry:
       type: object
       required: [masterId, score, place]
@@ -1966,13 +2214,33 @@ components:
         revokedAtUtc: {type: string, format: date-time, nullable: true}
     IntegrationGrantCreate:
       type: object
-      required: [subject, kind]
-      properties:
-        subject: {type: string, minLength: 1, maxLength: 100}
-        kind: {type: string, enum: [Progress, Award, Spend]}
-        campaignId: {type: string, format: uuid}
-        resourceId: {type: string, format: uuid}
-        purchaseSystemId: {type: string, format: uuid}
+      description: |
+        Строгие сочетания цели (B04): Progress → campaignId; Award → campaignId + resourceId;
+        Spend → resourceId + purchaseSystemId. Иные поля запрещены; нарушение — 400 validation.grant-target.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [subject, kind, campaignId]
+          properties:
+            subject: {type: string, minLength: 1, maxLength: 100}
+            kind: {type: string, enum: [Progress]}
+            campaignId: {type: string, format: uuid}
+        - type: object
+          additionalProperties: false
+          required: [subject, kind, campaignId, resourceId]
+          properties:
+            subject: {type: string, minLength: 1, maxLength: 100}
+            kind: {type: string, enum: [Award]}
+            campaignId: {type: string, format: uuid}
+            resourceId: {type: string, format: uuid}
+        - type: object
+          additionalProperties: false
+          required: [subject, kind, resourceId, purchaseSystemId]
+          properties:
+            subject: {type: string, minLength: 1, maxLength: 100}
+            kind: {type: string, enum: [Spend]}
+            resourceId: {type: string, format: uuid}
+            purchaseSystemId: {type: string, format: uuid}
     PurchaseSystem:
       type: object
       required: [id, code, name, status, acceptedResourceIds]
