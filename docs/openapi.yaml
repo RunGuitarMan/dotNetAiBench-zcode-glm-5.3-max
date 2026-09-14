@@ -3,20 +3,25 @@ info:
   title: Motiva API
   version: 1.2.0
   description: |
-    Мотивационные кампании Motiva, этап 2 (контракт, реализация отсутствует). Ревизия после H1.
+    Мотивационные кампании Motiva, этап 2 (контракт, реализация отсутствует). EXTERNALLY_NORMALIZED; происхождение и H0 — docs/stage-2.md.
     Соглашения:
     - Экономический отказ корректно сформированной операции — 201 с result=Declined (то же
       представление, что Posted); ошибки доступа/валидации — 4xx без создания ресурса операции.
     - Порядок обработки любого повтора: текущая авторизация проверяется первой (401/403 —
       без эффектов, ошибка доступа не создаёт бизнес-операцию и не превращается в сохранённый
       успех); далее номер: тот же номер + те же существенные данные — исходный статус и
-      представление; иные существенные данные — 409.
+      представление; иные существенные данные — 409. H0 Q08: ошибки валидации/прав и временный
+      технический сбой без committed согласованного результата номер не занимают; сохранённый
+      бизнес-отказ занимает номер; потеря ответа после commit его не освобождает.
     - Бизнес-номера (progress events, операции B24) бессрочны и не требуют Idempotency-Key;
       остальные создающие POST требуют Idempotency-Key (scope: company + инициатор + операция/цель + ключ).
+    - H0 Q06/Q07: целочисленные поля отклоняют дроби без округления; masterId — число
+      1..2147483647, сравнение/сортировка числовые, ведущие нули не создают другую личность.
     - Все операции изменения настроек (PATCH/PUT/DELETE) требуют If-Match; ETag доступен
       через GET объекта (strong). Экономические операции и удаление выписки If-Match не используют.
-    - Все списки: items + nextCursor, limit 1..100 (default 50); кешируемые неперсональные
-      каталоги несут обязательный asOfUtc (допуск 30 с; live-рейтинг 5 с).
+    - Все списки: items + nextCursor, limit 1..100 (default 50); исключение — live-рейтинг:
+      top N и отдельное собственное место, без cursor-обхода всей коллекции. Кешируемые
+      неперсональные каталоги несут обязательный asOfUtc (допуск 30 с; live-рейтинг 5 с).
 servers:
   - url: http://localhost:8080/api/v1
     description: Локальный стенд
@@ -900,7 +905,7 @@ paths:
     post:
       tags: [Budgets]
       summary: Выделить/увеличить бюджет (Admin); защищено номером операции
-      description: 'Существенные данные: campaignId (из URL), resourceId, amount, reason; ресурс обязан входить в набор кампании. Повтор номера: те же данные — исходный статус и сохранённое представление (бессрочно); иные — 409; кампания в область уникальности номера не входит; текущая авторизация проверяется первой.'
+      description: 'Существенные данные: campaignId (из URL), resourceId, amount, reason; ресурс обязан входить в набор кампании. Повтор номера: те же данные — исходный статус и сохранённое представление (бессрочно); иные — 409; кампания в область уникальности номера не входит; текущая авторизация проверяется первой. H0 Q09: новое выделение допускается в Draft/Published до конца срока и сезона кампании, включая будущую кампанию и время до её начала; архивной, завершившейся или прошлосезонной кампании новые выделения запрещены.'
       requestBody:
         required: true
         content:
@@ -1124,11 +1129,14 @@ paths:
       summary: Передать событие прогресса (интеграция с действующим grant Progress)
       description: |
         Порядок обработки: (1) проверенная идентичность и компания; (2) действующий grant
-        Progress на кампанию задания и обязательные проверки активности — отказ 401/403
-        без любых эффектов и без записи; (3) номер события (уникален company + проверенный
+        Progress на кампанию задания и обязательная активность получателя — для нового
+        обращения и replay до номера; неверный токен — 401, отказ прав/активности — 403
+        без любых эффектов и без записи события/занятого номера (H0 Q08, B16); (3) номер события (уникален company + проверенный
         subject + eventNumber, бессрочно, кампания в ключ не входит): новый — обработка
-        (Accepted или Rejected; отказ сохраняется как результат — B16.2, номер освобождается
-        только для неверных данных — B16.5); тот же номер + те же существенные данные
+        (Accepted или Rejected; сохранённый бизнес-отказ занимает номер — B16.2; H0 Q08:
+        ошибки валидации/прав и временный технический сбой без committed согласованного
+        результата номер не занимают, потеря ответа после commit его не освобождает); тот же
+        номер + те же существенные данные
         (masterId, taskId, переданная дельта; порядок JSON не важен) — исходный HTTP-статус
         и исходное сохранённое представление (completion остаётся null, если завершения
         не было на момент обработки); тот же номер с иными данными — 409. (4) Бизнес-предусловия —
@@ -1206,7 +1214,7 @@ paths:
     post:
       tags: [Economic]
       summary: 'Ручное начисление (владелец/Admin; интеграция — grant Award: кампания+ресурс)'
-      description: 'Повтор номера: существенные данные — campaignId (из URL), masterId, resourceId, amount, reason; те же — исходный статус и сохранённое представление (бессрочно); иные — 409; авторизация первой.'
+      description: 'Повтор номера: существенные данные — campaignId (из URL), masterId, resourceId, amount, reason; те же — исходный статус и сохранённое представление (бессрочно); иные — 409; авторизация первой. H0 Q01 (AMB-04 закрыт): новое ручное начисление допустимо активному сотруднику текущей аудитории действующей опубликованной кампании; предыдущее выполнение/прогресс не требуется.'
       parameters:
         - $ref: '#/components/parameters/uuidId'
       requestBody:
@@ -1232,7 +1240,7 @@ paths:
     post:
       tags: [Economic]
       summary: Полная отмена (Admin; текущий владелец кампании-источника — начисления; система покупок — свои траты при grant Spend)
-      description: 'Повтор номера: существенные данные — originalOperationId, reason; те же — исходный статус и сохранённое представление (бессрочно); иные — 409; авторизация первой. Отказы — экономические (201 Declined): InsufficientBalance, OriginalAlreadyReversed, OriginalNotPosted. Активность получателя для коррекции не требуется: Admin-коррекция заблокированного кошелька разрешена (B26–B27); владельцу и системе покупок при заблокированном получателе до решения AMB-02/03 возвращается 403.'
+      description: 'Повтор номера: существенные данные — originalOperationId, reason; те же — исходный статус и сохранённое представление (бессрочно); иные — 409; авторизация первой. Отказы — экономические (201 Declined): InsufficientBalance, OriginalAlreadyReversed, OriginalNotPosted. H0 Q03 (AMB-02/03 закрыты): корректирующая отмена при заблокированном получателе разрешена только Admin (B26–B27); владелец без Admin и service получают 403 без записи, в том числе перед replay.'
       requestBody:
         required: true
         content:
@@ -1268,13 +1276,20 @@ paths:
   /me/operations:
     get:
       tags: [Operations]
-      summary: Своя история операций (user — кошелька; service — инициированных субъектом)
+      summary: Своя история операций (user — кошелька; service — разрешённой системы покупок)
       description: |
-        Для сотрудника — операции его кошелька, включая отклонённые (B22.3).
-        Для service-субъекта (система покупок) цепочка: проверенный JWT subject → действующий
-        grant → конкретные purchaseSystemId и resourceId → только операции, инициатором
-        которых он является; subject ≠ purchaseSystemId, владение одной системой не даёт
-        весь кошелёк сотрудника (B04.3).
+        Для сотрудника — только операции его кошелька, включая отклонённые (B22.3).
+        Для service область — проверенная компания и действующие grants Spend его JWT subject
+        на конкретные пары (purchaseSystemId, resourceId): каждая пара соответствует одному
+        реально выданному grant, независимое объединение систем и ресурсов запрещено.
+        Доступны относящиеся к этим парам Spend и SpendReversal, включая сохранённые
+        Posted/Declined, независимо от инициатора (сотрудник, service или Admin).
+        Для SpendReversal принадлежность определяется исходной тратой через существующий
+        originalOperationId, её purchaseSystemId и resourceId в items; настоящий initiator сохраняется
+        в DTO. Начисления, остальные операции кошелька, другая компания/система и ресурс вне
+        grants недоступны. Текущие права проверяются при каждом чтении, включая страницы
+        со старым cursor; cursor не сохраняет отозванное право. Неверный токен — 401,
+        недостаточные полномочия/отсутствие действующего grant — 403 (B04/B05/B23/B27, T04).
         Повторы защищены номерами операций (бессрочно, сохранённый исходный ответ).
       parameters:
         - $ref: '#/components/parameters/limit'
@@ -1304,6 +1319,7 @@ paths:
                     items: {$ref: '#/components/schemas/Operation'}
                   nextCursor: {$ref: '#/components/schemas/Cursor'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /me/achievements:
     get:
       tags: [Wallets]
@@ -1430,6 +1446,18 @@ paths:
     get:
       tags: [Operations]
       summary: Операция (инициатор, задействованный сотрудник, Admin, своя система покупок)
+      description: |
+        Сотрудник читает только собственный кошелёк; права остальных user-ролей сохраняются.
+        Для service совпадение initiator с JWT subject не определяет доступ: в проверенной
+        компании доступны только Spend и SpendReversal по действующему grant Spend этого
+        subject на конкретную пару (purchaseSystemId, resourceId), как в GET /me/operations.
+        Пары систем и ресурсов не комбинируются между grants. Включены сохранённые
+        Posted/Declined независимо от настоящего initiator (сотрудник, service или Admin);
+        initiator в DTO не меняется. Возврат относится к системе/ресурсу исходной траты
+        через существующий originalOperationId. Начисления и прочая история кошелька, другая
+        компания/система и ресурс вне grants недоступны. Текущие права проверяются при
+        каждом чтении; известный operationId не обходит отзыв grant. Неверный токен — 401,
+        недостаточные полномочия — 403; чужой/недоступный персональный объект — 404 (T04).
       responses:
         '200':
           description: Полное представление операции
@@ -1481,7 +1509,10 @@ paths:
         возрастанию masterId. Состав данных — только masterId, счёт, место (B32.4).
         Граница доступа — «после сезона» (B32.5), а не «после финала»: Final — состояние
         результата, не основание досрочно менять права чтения; собственное историческое
-        участие проверяется по сохранённым challenge_results.
+        участие проверяется по сохранённым challenge_results. H0 Q04: до конца сезона
+        текущая аудитория читает и после конца/архива кампании; потерявший аудиторию не читает.
+        После сезона сотруднику нужна собственная историческая строка именно этого челленджа,
+        включая счёт 0; права владельца/Admin сохраняются по B32.
         state=Live — актуальный счёт, now − asOfUtc ≤ 5 с; Final — неизменяемые итоги,
         asOfUtc = момент финализации. Live-рейтинг — top N (limit), cursor-обход всей
         коллекции не обещается (T04).
@@ -1502,6 +1533,7 @@ paths:
     get:
       tags: [Leaderboards]
       summary: Собственное место
+      description: 'H0 Q04: правила доступа те же, что для GET /challenges/{id}/leaderboard; после сезона сотруднику требуется собственная историческая строка именно этого челленджа, включая счёт 0.'
       responses:
         '200':
           description: Место и счёт вызывающего
@@ -1766,13 +1798,13 @@ components:
       required: [actorType]
       properties:
         actorType: {type: string, enum: [user, service]}
-        masterId: {type: integer, format: int32, nullable: true}
+        masterId: {type: integer, format: int32, nullable: true, minimum: 1, maximum: 2147483647} # H0 Q07: положительный Int32
         subject: {type: string, nullable: true}
     Employee:
       type: object
       required: [masterId, isActive, tags, createdAtUtc]
       properties:
-        masterId: {type: integer, format: int32}
+        masterId: {type: integer, format: int32, minimum: 1, maximum: 2147483647} # H0 Q07: положительный Int32
         isActive: {type: boolean}
         tags:
           type: array
@@ -1807,7 +1839,7 @@ components:
       type: object
       required: [code, name]
       properties:
-        code: {type: string, pattern: '^[A-Za-z0-9_-]{1,40}$'}
+        code: {type: string, pattern: '^ *[A-Za-z0-9_-]{1,40} *$', description: 'H0 Q07: крайние обычные пробелы удаляются; затем алфавит/длина T05, непустое значение и сравнение без регистра; внутренние символы значимы'}
         name: {type: string, minLength: 1, maxLength: 200}
     ResourcePatch:
       type: object
@@ -1830,7 +1862,7 @@ components:
       type: object
       required: [code, name]
       properties:
-        code: {type: string, pattern: '^[A-Za-z0-9_-]{1,40}$'}
+        code: {type: string, pattern: '^ *[A-Za-z0-9_-]{1,40} *$', description: 'H0 Q07: крайние обычные пробелы удаляются; затем алфавит/длина T05, непустое значение и сравнение без регистра; внутренние символы значимы'}
         name: {type: string, minLength: 1, maxLength: 200}
         description: {type: string, maxLength: 2000}
     AchievementPatch:
@@ -1861,7 +1893,7 @@ components:
         name: {type: string, minLength: 1, maxLength: 200}
         description: {type: string, maxLength: 2000, nullable: true}
         season: {type: integer, format: int32}
-        ownerMasterId: {type: integer, format: int32}
+        ownerMasterId: {type: integer, format: int32, minimum: 1, maximum: 2147483647} # H0 Q07: положительный Int32
         startsAt: {type: string, format: date-time, description: 'С UTC offset на входе'}
         endsAt: {type: string, format: date-time}
         status: {type: string, enum: [Draft, Published, Archived]}
@@ -1870,12 +1902,13 @@ components:
         publishedAtUtc: {type: string, format: date-time, nullable: true}
     CampaignCreate:
       type: object
+      description: 'H0 Q05: сроки [startsAt, endsAt), startsAt строго раньше endsAt; исключённый конец может совпадать с началом следующего сезона; укороченный крайний период не уменьшает цель/награду.'
       required: [code, name, ownerMasterId, startsAt, endsAt]
       properties:
-        code: {type: string, pattern: '^[A-Za-z0-9_-]{1,40}$'}
+        code: {type: string, pattern: '^ *[A-Za-z0-9_-]{1,40} *$', description: 'H0 Q07: крайние обычные пробелы удаляются; затем алфавит/длина T05, непустое значение и сравнение без регистра; внутренние символы значимы'}
         name: {type: string, minLength: 1, maxLength: 200}
         description: {type: string, maxLength: 2000}
-        ownerMasterId: {type: integer, format: int32, minimum: 1}
+        ownerMasterId: {type: integer, format: int32, minimum: 1, maximum: 2147483647} # H0 Q07: положительный Int32
         startsAt: {type: string, format: date-time}
         endsAt: {type: string, format: date-time}
         audience: {$ref: '#/components/schemas/Audience'}
@@ -1898,6 +1931,7 @@ components:
         masterId:
           type: integer
           format: int32
+          maximum: 2147483647 # H0 Q07
           minimum: 1
           description: Действующий сотрудник компании; неактивный кандидат — 409
     CampaignResource:
@@ -1929,7 +1963,7 @@ components:
       type: object
       required: [code, name]
       properties:
-        code: {type: string, pattern: '^[A-Za-z0-9_-]{1,40}$'}
+        code: {type: string, pattern: '^ *[A-Za-z0-9_-]{1,40} *$', description: 'H0 Q07: крайние обычные пробелы удаляются; затем алфавит/длина T05, непустое значение и сравнение без регистра; внутренние символы значимы'}
         name: {type: string, minLength: 1, maxLength: 200}
     StreamPatch:
       type: object
@@ -1966,7 +2000,7 @@ components:
       type: object
       required: [code, name, goal, period, streamPoints, rewardItems]
       properties:
-        code: {type: string, pattern: '^[A-Za-z0-9_-]{1,40}$'}
+        code: {type: string, pattern: '^ *[A-Za-z0-9_-]{1,40} *$', description: 'H0 Q07: крайние обычные пробелы удаляются; затем алфавит/длина T05, непустое значение и сравнение без регистра; внутренние символы значимы'}
         name: {type: string, minLength: 1, maxLength: 200}
         description: {type: string, maxLength: 2000}
         goal: {type: integer, format: int64, minimum: 1, maximum: 1000000000}
@@ -2035,7 +2069,7 @@ components:
     ExternalNumber:
       type: string
       pattern: '^[\x21-\x7E]{1,100}$'
-      description: Внешний номер, регистрозависим
+      description: 'H0 Q07: внешний номер сравнивается точно и регистрозависимо, без нормализации кодов'
     BudgetAllocationCreate:
       type: object
       required: [resourceId, amount, operationNumber]
@@ -2073,7 +2107,7 @@ components:
         result: {type: string, enum: [Posted, Declined]}
         refusalCode: {$ref: '#/components/schemas/RefusalCode'}
         initiator: {$ref: '#/components/schemas/Actor'}
-        masterId: {type: integer, format: int32, nullable: true}
+        masterId: {type: integer, format: int32, nullable: true, minimum: 1, maximum: 2147483647} # H0 Q07: положительный Int32
         campaignId: {type: string, format: uuid, nullable: true}
         purchaseSystemId: {type: string, format: uuid, nullable: true}
         originalOperationId: {type: string, format: uuid, nullable: true}
@@ -2090,6 +2124,8 @@ components:
         masterId:
           type: integer
           format: int32
+          maximum: 2147483647 # H0 Q07
+          minimum: 1 # H0 Q07
           nullable: true
           description: Только для инициатора-системы покупок; сотруднику запрещено указывать чужой
         purchaseSystemId: {type: string, format: uuid}
@@ -2100,7 +2136,7 @@ components:
       type: object
       required: [masterId, resourceId, amount, reason, operationNumber]
       properties:
-        masterId: {type: integer, format: int32, minimum: 1}
+        masterId: {type: integer, format: int32, minimum: 1, maximum: 2147483647} # H0 Q07: положительный Int32
         resourceId: {type: string, format: uuid}
         amount: {type: integer, format: int64, minimum: 1, maximum: 1000000000}
         reason: {type: string, minLength: 1, maxLength: 2000}
@@ -2117,11 +2153,12 @@ components:
       required: [eventNumber, masterId, taskId, delta]
       properties:
         eventNumber: {$ref: '#/components/schemas/ExternalNumber'}
-        masterId: {type: integer, format: int32, minimum: 1}
+        masterId: {type: integer, format: int32, minimum: 1, maximum: 2147483647} # H0 Q07: положительный Int32
         taskId: {type: string, format: uuid}
         delta: {type: integer, format: int64, minimum: 1, maximum: 1000000000}
     RewardDecision:
       type: object
+      description: 'H0 Q02: пустой пакет — NotProvided; в непустом пакете недоступность любого его ресурса приоритетнее нехватки бюджета (DeclinedResourceUnavailable перед DeclinedInsufficientBudget); посторонний архивный ресурс не влияет.'
       required: [outcome]
       properties:
         outcome:
@@ -2134,7 +2171,7 @@ components:
       properties:
         taskId: {type: string, format: uuid}
         periodStart: {type: string, format: date-time}
-        streamPointsAdded: {type: integer, format: int64, minimum: 0}
+        streamPointsAdded: {type: integer, format: int64, minimum: 0, maximum: 1000000000} # H0 Q06, T05
         reward: {$ref: '#/components/schemas/RewardDecision'}
         completedAtUtc: {type: string, format: date-time}
     CompletionInfoNullable:
@@ -2145,7 +2182,7 @@ components:
       properties:
         taskId: {type: string, format: uuid}
         periodStart: {type: string, format: date-time}
-        streamPointsAdded: {type: integer, format: int64, minimum: 0}
+        streamPointsAdded: {type: integer, format: int64, minimum: 0, maximum: 1000000000} # H0 Q06, T05
         reward: {$ref: '#/components/schemas/RewardDecision'}
         completedAtUtc: {type: string, format: date-time}
     ProgressEventResult:
@@ -2163,15 +2200,16 @@ components:
           type: string
           nullable: true
           enum: [EmployeeNotActive, AudienceMismatch, CampaignClosed, TargetArchived, null]
-        masterId: {type: integer, format: int32}
+          description: 'H0 Q08, B16: EmployeeNotActive сохранён в enum для совместимости; ветка 201 Rejected/EmployeeNotActive недостижима для нового запроса — обязательная активность получателя проверяется до номера (403), в том числе перед replay.'
+        masterId: {type: integer, format: int32, minimum: 1, maximum: 2147483647} # H0 Q07: положительный Int32
         taskId: {type: string, format: uuid}
         periodStartUtc:
           type: string
           format: date-time
           nullable: true
           description: Период принятого события; null для Rejected
-        transmittedDelta: {type: integer, format: int64, minimum: 1}
-        creditedDelta: {type: integer, format: int64, minimum: 0}
+        transmittedDelta: {type: integer, format: int64, minimum: 1, maximum: 1000000000} # H0 Q06, T05
+        creditedDelta: {type: integer, format: int64, minimum: 0, maximum: 1000000000} # H0 Q06, T05
         acceptedAtUtc: {type: string, format: date-time}
         completion: {$ref: '#/components/schemas/CompletionInfoNullable'}
     WalletBalance:
@@ -2186,7 +2224,7 @@ components:
       type: object
       required: [masterId, balances, generatedAtUtc]
       properties:
-        masterId: {type: integer, format: int32}
+        masterId: {type: integer, format: int32, minimum: 1, maximum: 2147483647} # H0 Q07: положительный Int32
         balances:
           type: array
           items: {$ref: '#/components/schemas/WalletBalance'}
@@ -2207,7 +2245,7 @@ components:
         taskId: {type: string, format: uuid}
         code: {type: string}
         current: {type: integer, format: int64, minimum: 0}
-        goal: {type: integer, format: int64, minimum: 1}
+        goal: {type: integer, format: int64, minimum: 1, maximum: 1000000000} # H0 Q06, T05
         completed: {type: boolean}
         periodStart: {type: string, format: date-time}
         periodEnd: {type: string, format: date-time, description: 'Граница исключается'}
@@ -2227,7 +2265,7 @@ components:
             type: object
             required: [threshold, achievementId, earned]
             properties:
-              threshold: {type: integer, format: int64}
+              threshold: {type: integer, format: int64, minimum: 1, maximum: 1000000000} # H0 Q06, T05
               achievementId: {type: string, format: uuid}
               earned: {type: boolean}
     CampaignProgress:
@@ -2243,7 +2281,7 @@ components:
       type: object
       required: [masterId, streams]
       properties:
-        masterId: {type: integer, format: int32}
+        masterId: {type: integer, format: int32, minimum: 1, maximum: 2147483647} # H0 Q07: положительный Int32
         streams:
           type: array
           items: {$ref: '#/components/schemas/StreamProgress'}
@@ -2251,7 +2289,7 @@ components:
       type: object
       required: [masterId, score, place]
       properties:
-        masterId: {type: integer, format: int32}
+        masterId: {type: integer, format: int32, minimum: 1, maximum: 2147483647} # H0 Q07: положительный Int32
         score: {type: integer, format: int64, minimum: 0}
         place: {type: integer, format: int32, minimum: 1}
     LeaderboardPage:
@@ -2268,7 +2306,7 @@ components:
       description: 'При отсутствии участия: participating=false, score=null, place=null — без выдуманного нулевого участника или места'
       required: [masterId, participating, state, asOfUtc]
       properties:
-        masterId: {type: integer, format: int32}
+        masterId: {type: integer, format: int32, minimum: 1, maximum: 2147483647} # H0 Q07: положительный Int32
         participating: {type: boolean}
         score: {type: integer, format: int64, minimum: 0, nullable: true}
         place: {type: integer, format: int32, minimum: 1, nullable: true}
@@ -2331,7 +2369,7 @@ components:
       type: object
       required: [code, name]
       properties:
-        code: {type: string, pattern: '^[A-Za-z0-9_-]{1,40}$'}
+        code: {type: string, pattern: '^ *[A-Za-z0-9_-]{1,40} *$', description: 'H0 Q07: крайние обычные пробелы удаляются; затем алфавит/длина T05, непустое значение и сравнение без регистра; внутренние символы значимы'}
         name: {type: string, minLength: 1, maxLength: 200}
         acceptedResourceIds:
           type: array
@@ -2347,12 +2385,15 @@ components:
           items: {type: string, format: uuid}
     ExportCreate:
       type: object
+      description: 'H0 Q05: диапазон [fromUtc, toUtc), fromUtc строго раньше toUtc; отбор по времени движения не заменяет фиксированный снимок B36.'
       required: [scope, fromUtc, toUtc]
       properties:
         scope: {type: string, enum: [Own, Employee, Company]}
         masterId:
           type: integer
           format: int32
+          maximum: 2147483647 # H0 Q07
+          minimum: 1 # H0 Q07
           nullable: true
           description: Обязателен при scope=Employee (Admin)
         resourceId:
@@ -2368,7 +2409,7 @@ components:
       properties:
         id: {type: string, format: uuid}
         scope: {type: string, enum: [Own, Employee, Company]}
-        masterId: {type: integer, format: int32, nullable: true}
+        masterId: {type: integer, format: int32, nullable: true, minimum: 1, maximum: 2147483647} # H0 Q07: положительный Int32
         resourceCode: {type: string, nullable: true}
         fromUtc: {type: string, format: date-time}
         toUtc: {type: string, format: date-time}
