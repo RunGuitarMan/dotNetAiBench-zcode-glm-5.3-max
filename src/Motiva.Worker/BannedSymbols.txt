@@ -1,0 +1,6 @@
+# L01 (stage-2 §1.2): worker orchestration never touches persistence directly.
+T:Microsoft.EntityFrameworkCore.DbContext;Use cases only: resolve application services instead
+T:Microsoft.EntityFrameworkCore.DbSet`1;Use cases only: resolve application services instead
+T:Motiva.Infrastructure.Persistence.MotivaDbContext;Composition root only (Program.cs)
+N:Npgsql;Composition root only (Program.cs)
+N:Amazon.S3;Composition root only (Program.cs)

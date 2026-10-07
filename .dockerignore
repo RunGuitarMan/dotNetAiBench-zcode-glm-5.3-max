@@ -1,0 +1,10 @@
+**/bin
+**/obj
+**/.git
+artifacts
+auth/.local
+load
+docs
+tests
+tools
+.DS_Store

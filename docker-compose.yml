@@ -1,0 +1,140 @@
+# Motiva full stand (T01/T06): pinned images, healthchecks, 2 API replicas behind nginx,
+# 2 workers, PostgreSQL 17, Valkey 9, private S3 (MinIO). Ports are fixed host ports.
+name: motiva
+
+x-api-env: &api-env
+  Motiva__PostgresConnectionString: "Host=postgres;Port=5432;Database=motiva;Username=motiva;Password=motiva-stand"
+  Motiva__ValkeyEndpoint: "valkey:6379"
+  Motiva__S3ServiceUrl: "http://s3:9000"
+  Motiva__S3AccessKey: "motiva"
+  Motiva__S3SecretKey: "motiva-stand-secret"
+  Motiva__S3Bucket: "motiva-exports"
+  ASPNETCORE_ENVIRONMENT: "Production"
+
+services:
+  postgres:
+    image: postgres:17.9
+    environment:
+      POSTGRES_USER: motiva
+      POSTGRES_PASSWORD: motiva-stand
+      POSTGRES_DB: motiva
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U motiva -d motiva"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 4g }
+
+  valkey:
+    image: valkey/valkey:9.2
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512m }
+
+  s3:
+    image: minio/minio@sha256:d249d1fb6966de4d8ad26c04754b545205ff15a62e4fd19ebd0f26fa5baacbc0
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: motiva
+      MINIO_ROOT_PASSWORD: motiva-stand-secret
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+    volumes:
+      - s3data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 1g }
+
+  migrate:
+    build:
+      context: .
+      dockerfile: deploy/migrate.Dockerfile
+    environment:
+      Motiva__PostgresConnectionString: "Host=postgres;Port=5432;Database=motiva;Username=motiva;Password=motiva-stand"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["tools"]
+
+  api:
+    build:
+      context: .
+      dockerfile: deploy/api.Dockerfile
+    environment:
+      <<: *api-env
+    env_file:
+      # Created by `python3 auth/jwt.py prepare` BEFORE compose up (03_AUTH).
+      # A missing file fails this service with an explicit compose error.
+      - path: auth/.local/api.env
+        required: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+      resources:
+        limits: { cpus: "1", memory: 1g }
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  worker:
+    build:
+      context: .
+      dockerfile: deploy/api.Dockerfile
+    entrypoint: ["dotnet", "/app/worker/Motiva.Worker.dll"]
+    environment:
+      <<: *api-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+      resources:
+        limits: { cpus: "0.5", memory: 512m }
+
+  lb:
+    image: nginx:1.29.8
+    ports:
+      - "8080:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: ["load"]
+    volumes:
+      - ./load:/scripts:ro
+    entrypoint: ["k6"]
+
+volumes:
+  pgdata:
+  s3data:

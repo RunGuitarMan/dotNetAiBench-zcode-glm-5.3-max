@@ -68,3 +68,4 @@ __pycache__/
 /lock
 /refresh.lock
 /plugins/
+.DS_Store
