@@ -10,6 +10,7 @@ namespace Motiva.Application.Reads;
 /// bounded wait on cache failure with a PostgreSQL fallback. Personal audience filtering is
 /// applied in memory after the fetch; rights are never taken from the cache.</summary>
 public sealed class CatalogService(
+    CurrentRights rights,
     ICampaignCatalog campaigns,
     IEmployeeDirectory employees,
     ICompanyDirectory companies,
@@ -21,6 +22,9 @@ public sealed class CatalogService(
     public async Task<(IReadOnlyList<CampaignDto> Items, DateTimeOffset AsOfUtc)> ListCampaignsAsync(
         ActorContext actor, int? season, CampaignStatus? status, int limit, string? cursor, CancellationToken ct)
     {
+        // B05.1: catalog reads require an active profile too — a blocked initiator (even an
+        // admin claim in the token) gets 403 before any campaign data is returned.
+        await rights.EnsureActiveEmployeeAsync(actor, ct);
         var company = await companies.GetAsync(actor.CompanyId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
         var zone = DateTimeZoneProviders.Tzdb[company.TimeZoneId];
         var currentSeason = Domain.Periods.Seasons.SeasonOf(Instant.FromDateTimeOffset(timeProvider.GetUtcNow()), zone);
@@ -68,6 +72,7 @@ public sealed class CatalogService(
     public async Task<(IReadOnlyList<ResourceDto> Items, string? NextCursor)> ListResourcesAsync(
         ActorContext actor, ResourceStatus? status, int limit, string? cursor, CancellationToken ct)
     {
+        await rights.EnsureActiveEmployeeAsync(actor, ct);
         var (page, asOf) = await GetCatalogPageAsync(
             actor, "catalog:resources:" + actor.CompanyId + ":" + (status?.ToString() ?? "all"),
             () => resources.ListAsync(actor.CompanyId, status, MaxCatalog, null, ct),
@@ -78,6 +83,7 @@ public sealed class CatalogService(
     public async Task<(IReadOnlyList<AchievementDto> Items, string? NextCursor)> ListAchievementsAsync(
         ActorContext actor, int limit, string? cursor, CancellationToken ct)
     {
+        await rights.EnsureActiveEmployeeAsync(actor, ct);
         var (page, asOf) = await GetCatalogPageAsync(
             actor, "catalog:achievements:" + actor.CompanyId,
             () => achievements.ListAsync(actor.CompanyId, MaxCatalog, null, ct),

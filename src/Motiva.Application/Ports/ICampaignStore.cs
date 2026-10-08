@@ -64,6 +64,12 @@ public interface ICampaignCatalog
 
     Task<Page<TaskRec>> ListTasksAsync(Guid companyId, Guid streamId, int limit, string? cursor, CancellationToken ct);
 
+    /// <summary>Task listing scoped to the reader's tags (B11): the page contains only tasks
+    /// whose own audience matches; the cursor walks the underlying ordering, so sequential
+    /// reads reach every visible task and no hidden one.</summary>
+    Task<Page<TaskRec>> ListVisibleTasksAsync(
+        Guid companyId, Guid streamId, IReadOnlyCollection<string> readerTags, int limit, string? cursor, CancellationToken ct);
+
     Task<(UpdateOutcome Outcome, TaskRec? Value)> CreateTaskAsync(
         Guid companyId,
         Guid id,

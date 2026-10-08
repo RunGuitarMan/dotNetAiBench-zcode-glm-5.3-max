@@ -18,21 +18,45 @@ using Xunit;
 
 namespace Motiva.Tests.Functional;
 
-/// <summary>Deterministic test seam implementation: named pauses hold until released; failures
-/// throw ImpedimentFailureException, rolling the transaction back with no committed result.</summary>
+/// <summary>Deterministic test seam implementation: a named pause first signals that the
+/// production path REACHED the checkpoint, then holds until the test releases it — there is no
+/// silent auto-release, so a passing test proves the asserted ordering; the 120 s guard FAILS
+/// the test instead of faking progress. Failures throw ImpedimentFailureException, rolling the
+/// transaction back with no committed result.</summary>
 public sealed class ScriptedImpediments : ITestImpediments
 {
-    private readonly Dictionary<string, TaskCompletionSource> _checkpoints = new();
-    private readonly HashSet<string> _failures = new();
+    private static readonly TimeSpan Guard = TimeSpan.FromSeconds(120);
 
-    public void PauseOn(string checkpoint) => _checkpoints[checkpoint] = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly Dictionary<string, TaskCompletionSource> _checkpoints = new();
+    private readonly Dictionary<string, TaskCompletionSource> _reached = new();
+    private readonly HashSet<string> _failures = new();
+    private readonly HashSet<string> _once = new();
+    private readonly HashSet<string> _onceClaimed = new();
+
+    public void PauseOn(string checkpoint)
+    {
+        _checkpoints[checkpoint] = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _reached[checkpoint] = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    /// <summary>Pauses only the FIRST arrival at the checkpoint; every other arrival passes
+    /// through immediately — used to stop exactly one worker of a race without touching the
+    /// others.</summary>
+    public void PauseFirstOn(string checkpoint)
+    {
+        PauseOn(checkpoint);
+        _once.Add(checkpoint);
+    }
 
     public void FailOn(string checkpoint) => _failures.Add(checkpoint);
 
     public void Reset()
     {
         _checkpoints.Clear();
+        _reached.Clear();
         _failures.Clear();
+        _once.Clear();
+        _onceClaimed.Clear();
     }
 
     public void Release(string checkpoint)
@@ -43,6 +67,22 @@ public sealed class ScriptedImpediments : ITestImpediments
         }
     }
 
+    /// <summary>Resolves when the production path has reached the checkpoint; the test never
+    /// guesses phases with sleeps.</summary>
+    public async Task WaitReachedAsync(string checkpoint, CancellationToken ct = default)
+    {
+        if (!_reached.TryGetValue(checkpoint, out var tcs))
+        {
+            throw new InvalidOperationException("No pause registered for checkpoint " + checkpoint);
+        }
+
+        await await Task.WhenAny(tcs.Task, Task.Delay(Guard, ct));
+        if (!tcs.Task.IsCompleted)
+        {
+            throw new TimeoutException("Checkpoint " + checkpoint + " was not reached within " + Guard);
+        }
+    }
+
     public async Task CheckpointAsync(string name, CancellationToken cancellationToken)
     {
         if (_failures.Contains(name))
@@ -50,9 +90,28 @@ public sealed class ScriptedImpediments : ITestImpediments
             throw new ImpedimentFailureException(name);
         }
 
-        if (_checkpoints.TryGetValue(name, out var tcs))
+        if (!_checkpoints.TryGetValue(name, out var tcs))
         {
-            await await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(30), cancellationToken));
+            return;
+        }
+
+        if (_once.Contains(name) && !_onceClaimed.Add(name))
+        {
+            return; // a one-shot pause already holds its worker: everyone else passes through
+        }
+
+        _reached[name].TrySetResult();
+        await await Task.WhenAny(tcs.Task, Task.Delay(Guard, cancellationToken));
+        if (!tcs.Task.IsCompleted)
+        {
+            // Protective timeout: terminate a hanging test as FAILED — never proceed silently.
+            throw new TimeoutException("Checkpoint " + name + " was paused but never released by the test.");
+        }
+
+        if (_failures.Contains(name))
+        {
+            // The failure was armed while the checkpoint was held: it fires on release.
+            throw new ImpedimentFailureException(name);
         }
     }
 }

@@ -163,7 +163,42 @@ public sealed class S3FileStorage : IFileStorage, IDisposable
             continuation = list.NextContinuationToken;
         }
 
-        await AbortIncompleteUploadsAsync(prefix, ct);
+        await AbortIncompleteUploadsAsync(prefix, exceptKey: null, ct);
+    }
+
+    public async Task DeleteOthersAsync(string prefix, string keepKey, CancellationToken ct)
+    {
+        await EnsureBucketAsync(ct);
+        string? continuation = null;
+        while (true)
+        {
+            var list = await _client.ListObjectsV2Async(new ListObjectsV2Request
+            {
+                BucketName = _bucket,
+                Prefix = prefix,
+                ContinuationToken = continuation,
+            }, ct);
+            foreach (var summary in list.S3Objects.Where(s => !string.Equals(s.Key, keepKey, StringComparison.Ordinal)))
+            {
+                try
+                {
+                    await _client.DeleteObjectAsync(new DeleteObjectRequest { BucketName = _bucket, Key = summary.Key }, ct);
+                }
+                catch (AmazonS3Exception ex)
+                {
+                    Log.OnDeleteFailed(_logger, summary.Key, ex);
+                }
+            }
+
+            if (!list.IsTruncated)
+            {
+                break;
+            }
+
+            continuation = list.NextContinuationToken;
+        }
+
+        await AbortIncompleteUploadsAsync(prefix, exceptKey: keepKey, ct);
     }
 
     public async Task<string> ComputeChecksumAsync(string key, CancellationToken ct)
@@ -186,11 +221,18 @@ public sealed class S3FileStorage : IFileStorage, IDisposable
         return metadata.ContentLength;
     }
 
-    private async Task AbortIncompleteUploadsAsync(string prefix, CancellationToken ct)
+    /// <summary>Aborts incomplete multipart uploads under a prefix; an except key (null =
+    /// abort all) keeps the winner's in-flight upload alone.</summary>
+    private async Task AbortIncompleteUploadsAsync(string prefix, string? exceptKey, CancellationToken ct)
     {
         var uploads = await _client.ListMultipartUploadsAsync(new ListMultipartUploadsRequest { BucketName = _bucket, Prefix = prefix }, ct);
         foreach (var upload in uploads.MultipartUploads)
         {
+            if (exceptKey is not null && string.Equals(upload.Key, exceptKey, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
             await _client.AbortMultipartUploadAsync(new AbortMultipartUploadRequest
             {
                 BucketName = _bucket,

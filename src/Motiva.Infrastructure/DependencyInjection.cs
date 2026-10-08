@@ -29,7 +29,8 @@ public static class DependencyInjection
             var infraOptions = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<MotivaInfrastructureOptions>>().Value;
             options
                 .UseNpgsql(infraOptions.PostgresConnectionString)
-                .UseSnakeCaseNamingConvention();
+                .UseSnakeCaseNamingConvention()
+                .AddInterceptors(new DbCommandTimingInterceptor());
         });
 
         services.AddScoped<IUnitOfWork, UnitOfWork>();
@@ -55,6 +56,7 @@ public static class DependencyInjection
         services.AddSingleton<ICacheSnapshots, ValkeyCacheSnapshots>();
         services.AddScoped<HealthChecks>();
         services.AddSingleton<IFileStorage, S3FileStorage>();
+        services.AddSingleton<Motiva.Application.Common.IRequestMetrics, RequestMetricsSink>();
         return services;
     }
 }

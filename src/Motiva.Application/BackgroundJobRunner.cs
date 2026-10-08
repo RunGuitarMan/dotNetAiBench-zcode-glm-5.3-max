@@ -84,7 +84,15 @@ public sealed class BackgroundJobRunner(
             case "form-export":
                 {
                     var payload = CanonicalJson.Deserialize<ExportPayload>(job.Payload) ?? throw new InvalidOperationException("Bad payload");
-                    await exportFormation.HandleAsync(payload.ExportId, ct);
+                    var finished = await exportFormation.HandleAsync(payload.ExportId, ct);
+                    if (!finished)
+                    {
+                        // A live formation lease (e.g. of a crashed worker whose export lease
+                        // outlives the outbox lease) owns the attempt: retry after it expires,
+                        // never complete the job silently (S-4 recovery).
+                        throw new RetryAtException(timeProvider.GetUtcNow().AddSeconds(15).UtcDateTime);
+                    }
+
                     break;
                 }
 

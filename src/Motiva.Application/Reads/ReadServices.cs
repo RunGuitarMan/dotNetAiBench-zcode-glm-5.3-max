@@ -87,13 +87,37 @@ public sealed class ReadService(
 
     public async Task<OperationRec> GetOperationAsync(ActorContext actor, Guid operationId, CancellationToken ct)
     {
-        var operation = await operationsRead.GetAsync(actor, operationId, ct);
-        if (operation is null)
+        // The visibility decision lives here (B05, §3.3): the store is a pure data filter.
+        // A blocked initiator — even with an admin claim in the token — is rejected before
+        // any data is returned; activity always comes from the current profile, not the JWT.
+        if (actor.ActorType == ActorType.Service)
         {
-            throw new MotivaException(ErrorCode.NotFound);
+            await EnsureServiceSpendGrantAsync(actor, ct);
+            var serviceOperation = await operationsRead.GetByIdAsync(actor.CompanyId, operationId, ct)
+                ?? throw new MotivaException(ErrorCode.NotFound);
+            var pairs = await grants.ListActiveSpendPairsAsync(actor.CompanyId, actor.Subject, ct);
+            var pairSet = pairs.Select(p => (p.PurchaseSystemId, p.ResourceId)).ToHashSet();
+            var allowed = serviceOperation.Kind is OperationKind.Spend or OperationKind.SpendReversal
+                && serviceOperation.PurchaseSystemId is { } system
+                && serviceOperation.Items.Any(i => pairSet.Contains((system, i.ResourceId)));
+            if (!allowed)
+            {
+                throw new MotivaException(ErrorCode.NotFound);
+            }
+
+            return serviceOperation;
         }
 
-        return operation;
+        await rights.EnsureActiveEmployeeAsync(actor, ct);
+        var operation = await operationsRead.GetByIdAsync(actor.CompanyId, operationId, ct)
+            ?? throw new MotivaException(ErrorCode.NotFound);
+        if (operation.MasterId == actor.MasterId || actor.IsAdmin)
+        {
+            return operation;
+        }
+
+        // A foreign personal object is indistinguishable from a missing one (§3.3).
+        throw new MotivaException(ErrorCode.NotFound);
     }
 
     public async Task<Page<AchievementGrantRec>> ListOwnAchievementsAsync(
@@ -142,9 +166,10 @@ public sealed class ReadService(
     }
 }
 
-/// <summary>Operation history reads with per-actor visibility (§3.3): the service reads only
-/// Spend/SpendReversal rows of whole granted pairs of its company; employees only their own
-/// wallet; admins the whole company; GET of a foreign personal object is a 404.</summary>
+/// <summary>Operation history reads (§3.3) with per-actor scoping decided in the application
+/// layer: this store only filters data by the scope it is given. The service history is read
+/// by whole granted pairs of its company; employees their own wallet; admins the company;
+/// GET of a foreign personal object is a 404 decided by <see cref="ReadService"/>.</summary>
 public interface IOperationsReadStore
 {
     Task<Page<OperationRec>> ListOwnAsync(
@@ -158,7 +183,7 @@ public interface IOperationsReadStore
     Task<Page<OperationRec>> ListForCampaignAsync(
         ActorContext actor, Guid campaignId, int limit, string? cursor, DateTimeOffset? from, DateTimeOffset? toUtc, Guid? resourceId, CancellationToken ct);
 
-    Task<OperationRec?> GetAsync(ActorContext actor, Guid operationId, CancellationToken ct);
+    Task<OperationRec?> GetByIdAsync(Guid companyId, Guid operationId, CancellationToken ct);
 
     Task<Page<AuditRec>> ListAuditAsync(
         Guid companyId, int limit, string? cursor, DateTimeOffset? from, DateTimeOffset? toUtc, string? entityType, string? entityId, CancellationToken ct);

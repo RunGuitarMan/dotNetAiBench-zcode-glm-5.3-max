@@ -53,20 +53,34 @@ public sealed class CampaignsService(
             throw new MotivaException(ErrorCode.ValidationFailed, "A campaign must fit into a single season.");
         }
 
-        var owner = await employees.GetAsync(actor.CompanyId, ownerMasterId, ct)
-            ?? throw new MotivaException(ErrorCode.NotFound, "Owner profile not found.");
-        if (!owner.IsActive)
+        // All essential fields of the create: a changed description/window/owner/audience with
+        // the same key is a conflict, not a replay (T05).
+        var essential = CanonicalJson.Serialize(new
         {
-            throw new MotivaException(ErrorCode.ConflictState, "Owner must be an active employee.");
-        }
-
+            code,
+            season = seasonStart,
+            name,
+            description,
+            ownerMasterId,
+            startsAt = startsAt.UtcDateTime,
+            endsAt = endsAt.UtcDateTime,
+            audience = new { any = audienceRule.Any.OrderBy(t => t), all = audienceRule.All.OrderBy(t => t), none = audienceRule.None.OrderBy(t => t) },
+        });
         var now = timeProvider.GetUtcNow();
-        var essential = CanonicalJson.Serialize(new { code, season = seasonStart, name });
         await using var scope = await uow.BeginAsync(ct);
         var echo = await gate.BeginOrEchoAsync(actor.CompanyId, actor, "campaign.create", "-", idempotencyKey, essential, ct);
         if (echo is not null)
         {
             return new CommandResponse(echo.Status, echo.Body, echo.Location is not null ? locationPrefix + echo.Location : null);
+        }
+
+        // §3.0 order: current rights first, the saved replay second, mutable business
+        // preconditions last — a committed replay survives a later owner change.
+        var owner = await employees.GetAsync(actor.CompanyId, ownerMasterId, ct)
+            ?? throw new MotivaException(ErrorCode.NotFound, "Owner profile not found.");
+        if (!owner.IsActive)
+        {
+            throw new MotivaException(ErrorCode.ConflictState, "Owner must be an active employee.");
         }
 
         var id = Guid.NewGuid();
@@ -268,21 +282,37 @@ public sealed class CampaignsService(
     public async Task<CampaignRec> GetAsync(ActorContext actor, Guid id, CancellationToken ct)
     {
         var campaign = await campaigns.GetAsync(actor.CompanyId, id, ct) ?? throw new MotivaException(ErrorCode.NotFound);
+        await EnsureVisibleAsync(actor, campaign, ct);
+        return campaign;
+    }
+
+    /// <summary>Campaign visibility (B09.2, B11, B05.1): every reader must be an active
+    /// profile; the owner and admins see every state, other employees see published campaigns
+    /// of their audience only — detail and lists alike.</summary>
+    public async Task<EmployeeRec> EnsureVisibleAsync(ActorContext actor, CampaignRec campaign, CancellationToken ct)
+    {
         if (campaign.Status == CampaignStatus.Deleted)
         {
             throw new MotivaException(ErrorCode.NotFound);
         }
 
-        if (campaign.Status == CampaignStatus.Draft)
+        var employee = await rights.EnsureActiveEmployeeAsync(actor, ct);
+        if (actor.IsAdmin || campaign.OwnerMasterId == actor.MasterId)
         {
-            if (!actor.IsAdmin && campaign.OwnerMasterId != actor.MasterId)
-            {
-                // Drafts are visible only to the owner and admins (B09.2).
-                throw new MotivaException(ErrorCode.NotFound);
-            }
+            return employee;
         }
 
-        return campaign;
+        if (campaign.Status == CampaignStatus.Draft)
+        {
+            throw new MotivaException(ErrorCode.NotFound);
+        }
+
+        if (!campaign.Audience.Matches(new HashSet<string>(employee.Tags)))
+        {
+            throw new MotivaException(ErrorCode.AuthzForbidden, "The campaign is outside your audience.");
+        }
+
+        return employee;
     }
 
     /// <summary>Owner or admin may configure the campaign; the right follows the current owner

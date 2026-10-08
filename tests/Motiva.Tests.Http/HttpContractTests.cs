@@ -28,9 +28,31 @@ public sealed class AuthNegativeTests(MotivaHttpFixture fixture) : IAsyncLifetim
     [Fact]
     public async Task valid_employee_token_passes()
     {
+        // The identity must map to an ACTIVE profile (§3.3): create employee 123 first.
+        var admin = TestTokens.Issue(_company, masterId: 1, subject: "admin", admin: true);
+        using var create = new HttpRequestMessage(HttpMethod.Post, "/api/v1/employees")
+        {
+            Content = JsonContent.Create(new { masterId = 123, tags = Array.Empty<string>() }),
+        };
+        create.Headers.Authorization = new AuthenticationHeaderValue("Bearer", admin);
+        create.Headers.Add("Idempotency-Key", "auth-emp-123");
+        var created = await fixture.CreateClient().SendAsync(create);
+        Assert.True(created.IsSuccessStatusCode, (int)created.StatusCode + "");
+
         var token = TestTokens.Issue(_company, masterId: 123, subject: "employee-123");
         var (status, _) = await CallAsync(token);
         Assert.Equal(200, status);
+    }
+
+    [Fact]
+    public async Task user_token_without_profile_gets_403()
+    {
+        // A verified identity without an active business profile is not an active initiator:
+        // catalog reads are closed (B05.1, §3.3) — the same rule that closes blocked profiles.
+        var token = TestTokens.Issue(_company, masterId: 7777, subject: "ghost");
+        var (status, body) = await CallAsync(token);
+        Assert.Equal(403, status);
+        Assert.Contains("authz.employee-not-active", body);
     }
 
     [Fact]
@@ -309,6 +331,8 @@ public sealed class ContractTests(MotivaHttpFixture fixture) : IAsyncLifetime
             "/api/v1/campaigns",
             new { code = "SECRET", name = "n", ownerMasterId = 1, startsAt = "2026-10-01T00:00:00Z", endsAt = "2026-12-31T20:00:00Z" }))
             .Content.ReadFromJsonAsync<CampaignDto>();
+        // An ACTIVE employee profile backs the reading identity (§3.3).
+        await CreateAsync(admin, "/api/v1/employees", new { masterId = 123, tags = Array.Empty<string>() });
         var employee = Client(TestTokens.Issue(_company, masterId: 123, subject: "employee-123"));
         var visible = await employee.GetFromJsonAsync<PageDto<CampaignDto>>("/api/v1/campaigns");
         Assert.DoesNotContain(visible!.Items, c => c.Id == draft!.Id);

@@ -21,12 +21,17 @@ public sealed class ExportFormationHandler(
 {
     private const int PartSize = 8 * 1024 * 1024;
 
-    public async Task HandleAsync(Guid exportId, CancellationToken ct)
+    /// <summary>Runs one formation attempt. Returns true when the job is FINISHED (Ready,
+    /// reused bytes, deleted or already handled elsewhere); false when ANOTHER live lease owns
+    /// the formation — the caller must retry the job later, never complete it silently (a
+    /// crashed worker's job re-claimed while its export lease is still live would otherwise
+    /// leave the export stuck in Forming forever, S-4).</summary>
+    public async Task<bool> HandleAsync(Guid exportId, CancellationToken ct)
     {
         var export = await exports.LoadAsync(exportId, ct);
         if (export is null || export.Status is ExportStatus.Deleted or ExportStatus.Ready)
         {
-            return;
+            return true;
         }
 
         var leaseOwner = Environment.MachineName + "/" + Environment.ProcessId.ToString();
@@ -34,7 +39,7 @@ public sealed class ExportFormationHandler(
         var snapshot = await exports.TryStartFormingAsync(export.CompanyId, exportId, leaseOwner, leaseDuration, ct);
         if (!snapshot.Started)
         {
-            return; // another live lease owns the formation
+            return false; // another live lease owns the formation: retry after it expires
         }
 
         var generation = snapshot.NewGeneration;
@@ -47,17 +52,17 @@ public sealed class ExportFormationHandler(
             var beforeUpload = await exports.LoadAsync(exportId, ct);
             if (beforeUpload is null || beforeUpload.Status == ExportStatus.Deleted)
             {
-                return;
+                return true;
             }
 
             if (await storage.ExistsAsync(key, ct))
             {
                 // The per-attempt key is unique; existing bytes are our own retry — verify and reuse.
                 await VerifyAndReadyAsync(export.CompanyId, exportId, leaseOwner, generation, key, ct);
-                return;
+                return true;
             }
 
-            var (size, checksum) = await UploadCsvAsync(export, key, ct);
+            var (size, checksum) = await UploadCsvAsync(export, exportId, leaseOwner, generation, key, ct);
             await impediments.CheckpointAsync(Checkpoints.ExportAfterUploadBeforeReady, ct);
 
             // Deletion against a late worker: the upload is already complete, so remove our own
@@ -74,30 +79,52 @@ public sealed class ExportFormationHandler(
                     // The persisted cleanup intent of the deleted export will retry.
                 }
 
-                return;
+                return true;
             }
 
-            await exports.TryMarkReadyAsync(export.CompanyId, exportId, leaseOwner, generation, key, "v1", size, checksum, timeProvider.GetUtcNow(), ct);
+            var readied = await exports.TryMarkReadyAsync(
+                export.CompanyId, exportId, leaseOwner, generation, key, "v1", size, checksum, timeProvider.GetUtcNow(), ct);
+            if (readied)
+            {
+                // Losing attempts may have left their own objects behind (e.g. a crash between
+                // upload and Ready): the winner removes every sibling under the export prefix,
+                // so bytes exist for the Ready generation only (§3.6, T07).
+                try
+                {
+                    await storage.DeleteOthersAsync("exports/" + exportId.ToString() + "/", key, ct);
+                }
+                catch (Exception siblingEx) when (siblingEx is not MotivaException)
+                {
+                    // The Ready bytes are unaffected; a leftover sibling object is removed by
+                    // the cleanup sweep once this export is deleted.
+                }
+            }
         }
         catch (Exception ex) when (ex is not MotivaException)
         {
             await exports.TryMarkErrorAsync(export.CompanyId, exportId, leaseOwner, generation, ex.Message, ct);
             throw;
         }
+
+        return true;
     }
 
     /// <summary>Streams rows from the fixed snapshot into bounded multipart parts: memory holds
-    /// at most one part plus one keyset page (T07).</summary>
+    /// at most one part plus one keyset page (T07). Before every part the worker re-asserts it
+    /// still owns the live formation (row not deleted, lease extended): a worker whose lease
+    /// expired — or an export deleted mid-upload — aborts instead of writing bytes a later
+    /// cleanup would not know about (§3.6).</summary>
     private sealed class UploadState
     {
         public long Size;
     }
 
-    private async Task<(long Size, string Checksum)> UploadCsvAsync(ExportRec export, string key, CancellationToken ct)
+    private async Task<(long Size, string Checksum)> UploadCsvAsync(
+        ExportRec export, Guid exportId, string leaseOwner, int generation, string key, CancellationToken ct)
     {
         using var sha = SHA256.Create();
         var state = new UploadState();
-        var parts = ProducePartsAsync(export, sha, state, ct);
+        var parts = ProducePartsAsync(export, exportId, leaseOwner, generation, sha, state, ct);
         await storage.PutPartsAsync(key, parts, ct);
         lock (sha)
         {
@@ -107,8 +134,29 @@ public sealed class ExportFormationHandler(
         return (state.Size, Convert.ToHexString(sha.Hash!));
     }
 
+    /// <summary>Fence of the formation attempt: the row must not be deleted and the lease must
+    /// still be ours; otherwise the upload is aborted (the multipart upload is rolled back by
+    /// the storage adapter).</summary>
+    private async Task EnsureStillFormingAsync(Guid exportId, string leaseOwner, int generation, CancellationToken ct)
+    {
+        await impediments.CheckpointAsync(Checkpoints.ExportDuringUpload, ct);
+        var current = await exports.LoadAsync(exportId, ct);
+        if (current is null || current.Status == ExportStatus.Deleted)
+        {
+            throw new InvalidOperationException("The export was deleted during formation.");
+        }
+
+        if (!await exports.TryExtendLeaseAsync(current.CompanyId, exportId, leaseOwner, generation, ct))
+        {
+            throw new InvalidOperationException("The formation lease was lost to another attempt.");
+        }
+    }
+
     private async IAsyncEnumerable<byte[]> ProducePartsAsync(
         ExportRec export,
+        Guid exportId,
+        string leaseOwner,
+        int generation,
         SHA256 sha,
         UploadState state,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
@@ -135,6 +183,7 @@ public sealed class ExportFormationHandler(
             await WriteLinesAsync(part, [line], ct);
             if (part.Length >= PartSize)
             {
+                await EnsureStillFormingAsync(exportId, leaseOwner, generation, ct);
                 yield return YieldPart(part, sha, state);
             }
         }
@@ -146,6 +195,7 @@ public sealed class ExportFormationHandler(
 
         if (part.Length > 0)
         {
+            await EnsureStillFormingAsync(exportId, leaseOwner, generation, ct);
             yield return YieldPart(part, sha, state);
         }
     }

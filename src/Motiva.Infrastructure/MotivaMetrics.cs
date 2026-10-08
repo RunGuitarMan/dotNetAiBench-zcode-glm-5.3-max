@@ -1,11 +1,14 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using Motiva.Application.Common;
 
 namespace Motiva.Infrastructure;
 
-/// <summary>Lightweight metric registry (T06): request latency by kind, error counts, economic
-/// operation outcomes, outbox queue depth; exposed in Prometheus text format at /metrics.</summary>
+/// <summary>Lightweight metric registry (T06): request latency by kind, REAL database command
+/// latency by operation (measured by <see cref="DbCommandTimingInterceptor"/>), error counts,
+/// outbox queue depth; exposed in Prometheus text format at /metrics. Each histogram keeps its
+/// own samples — a DB duration series never reuses HTTP measurements.</summary>
 public static class MotivaMetrics
 {
     public const string MeterName = "Motiva";
@@ -15,10 +18,14 @@ public static class MotivaMetrics
     private static readonly Histogram<double> RequestDuration = Meter.CreateHistogram<double>(
         "motiva_request_duration_ms", "ms", "HTTP request duration by operation kind");
     private static readonly Histogram<double> DbOperationDuration = Meter.CreateHistogram<double>(
-        "motiva_db_duration_ms", "ms", "Database operation duration");
+        "motiva_db_duration_ms", "ms", "Database command duration by operation");
 
     private static readonly ObservableGauge<double> QueueDepth = Meter.CreateObservableGauge(
         "motiva_outbox_pending", () => new Measurement<double>(LoadCounter("outbox:pending")), "jobs", "Outbox jobs waiting");
+
+    private static readonly object LatencyLock = new();
+    private static readonly List<(string Kind, double Milliseconds)> RequestLatencies = [];
+    private static readonly List<(string Operation, double Milliseconds)> DbLatencies = [];
 
     public static void ObserveRequest(string kind, double milliseconds)
     {
@@ -33,9 +40,17 @@ public static class MotivaMetrics
         }
     }
 
-    public static void ObserveDb(double milliseconds, string operation)
+    public static void ObserveDb(string operation, double milliseconds)
     {
         DbOperationDuration.Record(milliseconds, new KeyValuePair<string, object?>("operation", operation));
+        lock (LatencyLock)
+        {
+            DbLatencies.Add((operation, milliseconds));
+            if (DbLatencies.Count > 20_000)
+            {
+                DbLatencies.RemoveRange(0, DbLatencies.Count - 10_000);
+            }
+        }
     }
 
     public static void Count(string name, long delta = 1)
@@ -63,23 +78,22 @@ public static class MotivaMetrics
             builder.Append("motiva_").Append(pair.Key.Replace(':', '_')).Append(' ').Append(pair.Value).Append('\n');
         }
 
-        RenderHistogram(RequestDuration, "motiva_request_duration_ms", builder);
-        RenderHistogram(DbOperationDuration, "motiva_db_duration_ms", builder);
+        List<(string Kind, double Milliseconds)> requests;
+        List<(string Operation, double Milliseconds)> db;
+        lock (LatencyLock)
+        {
+            requests = [.. RequestLatencies];
+            db = [.. DbLatencies];
+        }
+
+        RenderSummary("motiva_request_duration_ms", requests.Select(x => (x.Kind, x.Milliseconds)), builder);
+        RenderSummary("motiva_db_duration_ms", db.Select(x => (x.Operation, x.Milliseconds)), builder);
         return builder.ToString();
     }
 
-    private static readonly object LatencyLock = new();
-    private static readonly List<(string Kind, double Milliseconds)> RequestLatencies = [];
-
-    private static void RenderHistogram(Histogram<double> histogram, string name, System.Text.StringBuilder builder)
+    private static void RenderSummary(string name, IEnumerable<(string Label, double Milliseconds)> samples, System.Text.StringBuilder builder)
     {
-        List<(string Kind, double Milliseconds)> snapshot;
-        lock (LatencyLock)
-        {
-            snapshot = [.. RequestLatencies];
-        }
-
-        var grouped = snapshot.GroupBy(x => x.Kind).OrderBy(g => g.Key, StringComparer.Ordinal);
+        var grouped = samples.GroupBy(x => x.Label).OrderBy(g => g.Key, StringComparer.Ordinal);
         builder.Append("# TYPE ").Append(name).Append(" summary\n");
         foreach (var group in grouped)
         {
@@ -99,4 +113,13 @@ public static class MotivaMetrics
             builder.Append(name).Append("_count{kind=\"").Append(group.Key).Append("\"} ").Append(sorted.Count).Append('\n');
         }
     }
+}
+
+/// <summary>DI adapter: the Api middleware observes through the application-level seam without
+/// referencing Infrastructure (L01); the static registry stays process-wide.</summary>
+public sealed class RequestMetricsSink : IRequestMetrics
+{
+    public void ObserveRequest(string kind, double milliseconds) => MotivaMetrics.ObserveRequest(kind, milliseconds);
+
+    public void Count(string name, long delta = 1) => MotivaMetrics.Count(name, delta);
 }

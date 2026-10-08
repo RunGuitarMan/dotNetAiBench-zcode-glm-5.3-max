@@ -58,5 +58,8 @@ public static class Checkpoints
     public const string ProgressAfterCommitBeforeResponse = "progress.after-commit-before-response";
     public const string ManualAwardBeforeCommit = "manual-award.before-commit";
     public const string ExportBeforeSnapshotCommit = "export.before-snapshot-commit";
+
+    /// <summary>Reached between the streamed upload parts, before the formation fence.</summary>
+    public const string ExportDuringUpload = "export.during-upload";
     public const string ExportAfterUploadBeforeReady = "export.after-upload-before-ready";
 }

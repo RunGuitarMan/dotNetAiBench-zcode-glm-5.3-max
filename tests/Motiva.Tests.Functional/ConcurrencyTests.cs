@@ -91,20 +91,58 @@ public sealed class ConcurrencyTests(MotivaFunctionalFixture fixture)
     [Fact]
     public async Task edge02_one_achievement_via_two_milestones_under_parallel_completions()
     {
+        // EDGE-02 (T3-11): two PARALLEL completions of two tasks of one stream cross the
+        // thresholds 10 and 20 that both lead to achievement X — X is granted exactly once
+        // (B30.2 PK per season) and no threshold is lost (§3.8).
         var world = await fixture.NewWorldAsync();
         await world.CreateEmployeeAsync(400);
         var x = await world.CreateAchievementAsync("X");
-        var setup = await world.CreatePublishedCampaignAsync(
-            "EDG2",
-            milestones: new[] { (10L, x), (20L, x) });
-        // Two tasks in the stream: publish helper creates one; add another before publish is impossible,
-        // so use two sequential completions crossing both thresholds with parallel second tasks is covered
-        // by the parallel events test; here verify joint milestone crossing with a single big completion.
-        await world.CreateGrantAsync("src", "Progress", setup.CampaignId);
-        await world.SendEventAsync("src", "E1", 400, setup.TaskId, 3);
+        var campaigns = world.Resolve<Motiva.Application.Campaigns.CampaignsService>();
+        var content = world.Resolve<Motiva.Application.Campaigns.CampaignContentService>();
+        var create = await campaigns.CreateAsync(world.Admin, "EDG2", "n", null, 1,
+            new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero),
+            new DateTimeOffset(2026, 12, 31, 20, 0, 0, TimeSpan.Zero), null, "c-edge2", CancellationToken.None);
+        var campaignId = TestWorld.ParseJson(create.Body).GetProperty("id").GetString()!;
+        var stream = await content.CreateStreamAsync(world.Admin, Guid.Parse(campaignId), "S1", "Stream", "s-edge2", CancellationToken.None);
+        var streamId = TestWorld.ParseJson(stream.Body).GetProperty("id").GetString()!;
 
+        // Task A awards 10 stream points, task B 15: the two completions cross threshold 10
+        // (sum 10) and threshold 20 (sum 25) — 20 lies between the two sums (§3.8).
+        var taskA = await content.CreateTaskAsync(world.Admin, Guid.Parse(streamId), "TA", "A", null, 1,
+            Motiva.Domain.Periods.PeriodKind.Day, 10, [], null, "t-a", CancellationToken.None);
+        var taskB = await content.CreateTaskAsync(world.Admin, Guid.Parse(streamId), "TB", "B", null, 1,
+            Motiva.Domain.Periods.PeriodKind.Day, 15, [], null, "t-b", CancellationToken.None);
+        var taskAId = TestWorld.ParseJson(taskA.Body).GetProperty("id").GetString()!;
+        var taskBId = TestWorld.ParseJson(taskB.Body).GetProperty("id").GetString()!;
+
+        await content.CreateMilestoneAsync(world.Admin, Guid.Parse(streamId), 10, x, "ms-10", CancellationToken.None);        await content.CreateMilestoneAsync(world.Admin, Guid.Parse(streamId), 20, x, "ms-20", CancellationToken.None);
+        var current = await campaigns.GetAsync(world.Admin, Guid.Parse(campaignId), CancellationToken.None);
+        await campaigns.PatchAsync(world.Admin, Guid.Parse(campaignId), ETags.Format(current.Version), null, null, null,
+            Motiva.Application.Ports.CampaignStatus.Published, CancellationToken.None);
+        await world.CreateGrantAsync("src", "Progress", Guid.Parse(campaignId));
+
+        // Two completions started together by the barrier — one per task of the SAME stream.
+        var barrier = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completeA = Task.Run(async () =>
+        {
+            await barrier.Task;
+            return await world.SendEventAsync("src", "E1", 400, Guid.Parse(taskAId), 1);
+        });
+        var completeB = Task.Run(async () =>
+        {
+            await barrier.Task;
+            return await world.SendEventAsync("src", "E2", 400, Guid.Parse(taskBId), 1);
+        });
+        barrier.SetResult();
+        await Task.WhenAll(completeA, completeB);
+
+        // Both completions happened and both thresholds were crossed — the grant is single.
         var grants = await world.Resolve<ReadService>().ListOwnAchievementsAsync(world.Employee(400), null, 100, null, CancellationToken.None);
-        Assert.Single(grants.Items, g => g.Code == "X");
+        var xGrants = grants.Items.Where(g => g.Code == "X").ToList();
+        Assert.Single(xGrants);
+        var progress = await world.Resolve<ReadService>().GetOwnCampaignProgressAsync(world.Employee(400), Guid.Parse(campaignId), CancellationToken.None);
+        var streamPoints = progress.Streams.Single().Points;
+        Assert.Equal(25, streamPoints); // 10 + 15: both completions counted exactly once
     }
 
     [Fact]

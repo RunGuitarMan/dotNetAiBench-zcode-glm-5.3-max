@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Emits "-e KEY=VALUE" pairs for the k6 load containers from the wrapper tokens and the
-# seeded stand state (challenges, first tasks, shop, resource).
+# seeded stand state (challenges, first tasks, shop, resource, the LAST race pair).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 python3 - <<'PY'
@@ -26,11 +26,26 @@ if not challenges:
 if not system_rows or not resource_rows:
     raise SystemExit('k6env: no seeded shop/resource — run scripts/load.sh seed first')
 
+# The race pair: the LATEST SEEDRACE campaign. Its budget must hold EXACTLY the reward (the
+# genuinely last remainder) — the adapter refuses to run a race over a stale remainder.
 race = []
-for row in q("SELECT t.goal, t.id FROM tasks t JOIN streams s ON s.id=t.stream_id JOIN campaigns c ON c.id=s.campaign_id "
-             "WHERE c.code_norm='SEEDC00' AND t.code_norm='T01' AND c.company_id='11111111-1111-4111-8111-111111111111'"):
-    goal, tid = row.split(',')
-    race.append({'goal': int(goal), 'taskId': tid})
+race_rows = q(
+    "SELECT t.goal, t.id, b.allocated_total - b.spent_total + b.returned_total "
+    "FROM campaigns c "
+    "JOIN budgets b ON b.campaign_id = c.id "
+    "JOIN streams s ON s.campaign_id = c.id "
+    "JOIN tasks t ON t.stream_id = s.id "
+    "WHERE c.code_norm LIKE 'SEEDRACE%' AND t.code_norm='TR' "
+    "  AND c.company_id='11111111-1111-4111-8111-111111111111' "
+    "ORDER BY c.created_at DESC LIMIT 1")
+if not race_rows:
+    raise SystemExit('k6env: no race pair — run scripts/load.sh seed first (T09 competitors)')
+goal, tid, remainder = race_rows[0].split(',')
+goal, remainder = int(goal), int(remainder)
+if remainder != 10 or goal != 3:
+    raise SystemExit(f'k6env: race pair remainder is {remainder}, goal {goal} — expected exactly 10/3; re-run seed')
+race.append({'goal': goal, 'taskId': tid})
+print(f'k6env: race pair OK (goal={goal}, remainder={remainder})', file=__import__('sys').stderr)
 
 pairs = ['-e', 'EMP_TOKEN=' + emp,
          '-e', 'SRC_TOKEN=' + src,
@@ -41,6 +56,7 @@ pairs = ['-e', 'EMP_TOKEN=' + emp,
          '-e', 'PURCHASE_SYSTEM_ID=' + system_rows[0],
          '-e', 'RESOURCE_ID=' + resource_rows[0],
          '-e', 'EMPLOYEE_MAX=10002',
+         '-e', 'SEED=42',
          '-e', 'RACE_TARGETS=' + json.dumps(race, separators=(',', ':'))]
 print(' '.join(pairs))
 PY

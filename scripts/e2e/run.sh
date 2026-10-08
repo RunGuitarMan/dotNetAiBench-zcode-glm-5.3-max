@@ -165,12 +165,19 @@ if [ "${READY:-0}" != "1" ]; then
   fail "export did not become Ready (status=$STATUS)"
 else
   pass "export Ready via worker"
-  LINK1=$(api POST "/api/v1/exports/$EID/download-links" "$TOK_EMP" "Idempotency-Key: $CODE-l1" | jsonget "['url']")
-  CS1=$(curl -s "$LINK1" | shasum -a 256 | cut -d' ' -f1)
-  sleep 1
-  LINK2=$(api POST "/api/v1/exports/$EID/download-links" "$TOK_EMP" "Idempotency-Key: $CODE-l2" | jsonget "['url']")
-  CS2=$(curl -s "$LINK2" | shasum -a 256 | cut -d' ' -f1)
-  [ "$CS1" = "$CS2" ] && pass "export bytes immutable across downloads" || fail "export bytes changed"
+  LINK1_RESP=$(api POST "/api/v1/exports/$EID/download-links" "$TOK_EMP" "" "Idempotency-Key: $CODE-l1")
+  LINK1=$(echo "$LINK1_RESP" | jsonget "['url']")
+  if [ -z "$LINK1" ]; then
+    fail "download link response has no url: $LINK1_RESP"
+  else
+    CS1=$(curl -s --max-time 60 "$LINK1" | shasum -a 256 | cut -d' ' -f1)
+    [ -n "$CS1" ] && [ "$CS1" != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ] \
+      && pass "downloaded CSV is non-empty" || fail "empty CSV from a Ready export"
+    sleep 1
+    LINK2=$(api POST "/api/v1/exports/$EID/download-links" "$TOK_EMP" "" "Idempotency-Key: $CODE-l2" | jsonget "['url']")
+    CS2=$(curl -s --max-time 60 "$LINK2" | shasum -a 256 | cut -d' ' -f1)
+    [ "$CS1" = "$CS2" ] && pass "export bytes immutable across downloads" || fail "export bytes changed"
+  fi
 fi
 
 # ---------------------------------------------------------------- S3 outage
@@ -183,6 +190,96 @@ docker compose start s3 >/dev/null
 [ "$EV4_STATUS" = "201" ] && pass "progress accounting unaffected by S3 outage" || fail "progress failed during S3 outage: $EV4_STATUS"
 if [ "${LINK_STATUS:0:3}" = "424" ] || [ "${LINK_STATUS:0:3}" = "409" ]; then pass "link issue during S3 outage -> $LINK_STATUS"; else fail "unexpected link status during S3 outage: $LINK_STATUS"; fi
 await "$LB/health/ready" 200 60
+
+# ---------------------------------------------------------------- metrics on controlled traffic (D16)
+note "T02/T06: /metrics reflects controlled requests — HTTP and REAL DB series"
+# The check reads ONE replica directly (the LB round-robins between two) and drives traffic
+# at the same replica, so the counter deltas are deterministic.
+replica_metrics() { docker compose exec -T api curl -s localhost:8080/metrics; }
+MET1_READ=$(replica_metrics | grep 'motiva_request_duration_ms_count{kind="read"}' | awk '{print $2}')
+MET1_DB=$(replica_metrics | grep -c 'motiva_db_duration_ms_count')
+for i in $(seq 1 10); do docker compose exec -T api curl -s -o /dev/null localhost:8080/api/v1/resources -H "Authorization: Bearer $TOK_EMP"; done
+MET2_READ=$(replica_metrics | grep 'motiva_request_duration_ms_count{kind="read"}' | awk '{print $2}')
+MET2_DB=$(replica_metrics | grep 'motiva_db_duration_ms_count' | head -1)
+[ -n "$MET2_READ" ] && [ -n "$MET1_READ" ] && [ "$MET2_READ" -gt "$MET1_READ" ] \
+  && pass "request latency series grew on controlled GETs ($MET1_READ -> $MET2_READ)" \
+  || fail "request metrics did not react to controlled traffic"
+[ "$MET1_DB" -ge 1 ] && [ -n "$MET2_DB" ] \
+  && pass "DB duration series present with real measurements (e.g. $MET2_DB)" \
+  || fail "DB duration series missing — /metrics would not explain DB behaviour"
+
+# ---------------------------------------------------------------- S-4: worker killed mid-formation
+note "T3-20/S-4: worker KILLED between upload and Ready — recovery, same snapshot, no dupes"
+docker stop motiva-worker-2 >/dev/null 2>&1 # deterministic: worker-1 owns the formation
+EXP2=$(api POST /api/v1/exports "$TOK_ADMIN" '{"scope":"Company","fromUtc":"2026-01-01T00:00:00Z","toUtc":"2026-12-31T00:00:00Z"}' "Idempotency-Key: $CODE-x2")
+EID2=$(echo "$EXP2" | jsonget "['id']")
+# Deterministic phase: wait until the worker has COMMITTED Forming (snapshot frozen) —
+# killing inside the snapshot transaction would only test the LB timeout.
+FORMING=""
+for i in $(seq 1 20); do
+  S=$(docker compose exec -T postgres psql -U motiva -d motiva -t -A -c "SELECT status FROM export_requests WHERE id='$EID2'")
+  [ "$S" = "Forming" ] && FORMING=1 && break
+  sleep 1
+done
+[ "${FORMING:-0}" = "1" ] || fail "S-4: export never reached Forming ($S)"
+docker kill motiva-worker-1 >/dev/null 2>&1
+docker start motiva-worker-1 motiva-worker-2 >/dev/null 2>&1
+READY2=""
+for i in $(seq 1 150); do
+  STATUS2=$(api GET "/api/v1/exports/$EID2" "$TOK_ADMIN" | jsonget "['status']")
+  [ "$STATUS2" = "Ready" ] && READY2=1 && break
+  [ "$STATUS2" = "Error" ] && break
+  sleep 1
+done
+if [ "${READY2:-0}" != "1" ]; then
+  fail "export after worker kill did not recover to Ready (status=$STATUS2)"
+else
+  pass "export recovered to Ready after a real worker kill"
+  # The recovered bytes match the DB exactly: one row per posted movement in range.
+  LINK_RESP=$(api POST "/api/v1/exports/$EID2/download-links" "$TOK_ADMIN" "" "Idempotency-Key: $CODE-l4")
+  LINK3=$(echo "$LINK_RESP" | jsonget "['url']")
+  if [ -z "$LINK3" ]; then
+    fail "download link response has no url: $LINK_RESP"
+  else
+    LINES=$(curl -s --max-time 60 "$LINK3" | tail -n +2 | grep -c . || true)
+    EXPECTED=$(docker compose exec -T postgres psql -U motiva -d motiva -t -A -c \
+      "SELECT count(*) FROM operations WHERE company_id='$COMPANY' AND result='Posted' AND kind IN ('TaskReward','ManualAward','Spend','SpendReversal','AwardReversal') AND created_at >= '2026-01-01' AND created_at < '2026-12-31'")
+    [ "$LINES" = "$((EXPECTED))" ] && pass "recovered export content == DB movements ($LINES rows)" \
+      || fail "recovered export rows=$LINES, expected=$EXPECTED (lost/duplicated effect)"
+  fi
+fi
+
+# ------------------------------------------------- S-3: real late worker vs delete + cleanup
+note "T3-20/S-3: paused worker resumes AFTER delete — fenced, no resurrection, bytes cleaned"
+docker stop motiva-worker-2 >/dev/null 2>&1
+EXP3=$(api POST /api/v1/exports "$TOK_ADMIN" '{"scope":"Company","fromUtc":"2026-01-01T00:00:00Z","toUtc":"2026-12-31T00:00:00Z"}' "Idempotency-Key: $CODE-x3")
+EID3=$(echo "$EXP3" | jsonget "['id']")
+# Wait for the COMMITTED Forming phase (the frozen transaction must not hold the row lock):
+# the job may first sit in a stopped worker's outbox lease (30 s) before re-claim.
+FORMING3=""
+for i in $(seq 1 90); do
+  S3=$(docker compose exec -T postgres psql -U motiva -d motiva -t -A -c "SELECT status FROM export_requests WHERE id='$EID3'")
+  [ "$S3" = "Forming" ] && FORMING3=1 && break
+  [ "$S3" = "Ready" ] && break   # too fast to catch mid-formation on a small stand
+  sleep 1
+done
+if [ "${FORMING3:-0}" != "1" ]; then
+  fail "S-3: export never caught in Forming ($S3) — late-worker trace not exercised"
+else
+  docker pause motiva-worker-1 >/dev/null   # a real frozen process holding the lease
+  DEL_STATUS=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -X DELETE "$LB/api/v1/exports/$EID3" -H "Authorization: Bearer $TOK_ADMIN")
+  [ "$DEL_STATUS" = "204" ] && pass "delete during live lease returned 204" || fail "delete during formation: HTTP $DEL_STATUS"
+  DEL_REPLAY=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$LB/api/v1/exports/$EID3/download-links" -H "Authorization: Bearer $TOK_ADMIN" -H "Idempotency-Key: $CODE-l5")
+  docker start motiva-worker-2 >/dev/null 2>&1
+  sleep 70                  # the formation lease expires; cleanup sweep settles the intent
+  docker unpause motiva-worker-1 >/dev/null # the late worker resumes: the fence aborts it
+  sleep 20                  # retries and sweeps settle
+  FINAL3=$(api GET "/api/v1/exports/$EID3" "$TOK_ADMIN" | jsonget "['status']")
+  [ "$DEL_REPLAY" = "409" ] && pass "deleted export: link replay refused with 409" || fail "link replay after delete: $DEL_REPLAY"
+  [ "$FINAL3" = "Deleted" ] && pass "no resurrection by the late real worker" || fail "export state after late worker: $FINAL3"
+  INTENT=$(docker compose exec -T postgres psql -U motiva -d motiva -t -A -c "SELECT cleanup_intent FROM export_requests WHERE id='$EID3'")
+  [ "$INTENT" = "f" ] && pass "cleanup intent settled (bytes of all attempts removed)" || fail "cleanup intent still set: $INTENT"
+fi
 
 note "summary: $FAILURES failures (artifacts/e2e)"
 [ "$FAILURES" = "0" ] || exit 1

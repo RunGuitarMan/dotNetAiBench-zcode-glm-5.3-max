@@ -43,36 +43,8 @@ public sealed class OperationsReadStore(
         ActorContext actor, Guid campaignId, int limit, string? cursor, DateTimeOffset? from, DateTimeOffset? toUtc, Guid? resourceId, CancellationToken ct)
         => operations.ListForCampaignAsync(actor.CompanyId, campaignId, limit, cursor, from, toUtc, resourceId, ct);
 
-    public async Task<OperationRec?> GetAsync(ActorContext actor, Guid operationId, CancellationToken ct)
-    {
-        var operation = await operations.GetAsync(actor.CompanyId, operationId, ct);
-        if (operation is null)
-        {
-            return null;
-        }
-
-        if (actor.IsAdmin)
-        {
-            return operation;
-        }
-
-        if (actor.ActorType == ActorType.Service)
-        {
-            var pairs = await grants.ListActiveSpendPairsAsync(actor.CompanyId, actor.Subject, ct);
-            if (pairs.Count == 0)
-            {
-                return null; // the application layer decides whether a missing grant is a 403
-            }
-
-            var pairSet = pairs.Select(p => (p.PurchaseSystemId, p.ResourceId)).ToHashSet();
-            var allowed = operation.Kind is OperationKind.Spend or OperationKind.SpendReversal
-                && operation.PurchaseSystemId is { } system
-                && operation.Items.Any(i => pairSet.Contains((system, i.ResourceId)));
-            return allowed ? operation : null;
-        }
-
-        return operation.MasterId == actor.MasterId ? operation : null;
-    }
+    public Task<OperationRec?> GetByIdAsync(Guid companyId, Guid operationId, CancellationToken ct)
+        => operations.GetAsync(companyId, operationId, ct);
 
     public Task<Page<AuditRec>> ListAuditAsync(
         Guid companyId, int limit, string? cursor, DateTimeOffset? from, DateTimeOffset? toUtc, string? entityType, string? entityId, CancellationToken ct)

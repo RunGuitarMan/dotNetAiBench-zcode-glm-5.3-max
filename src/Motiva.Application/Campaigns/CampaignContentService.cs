@@ -12,6 +12,7 @@ public sealed class CampaignContentService(
     CurrentRights rights,
     CampaignsService campaignsService,
     ICampaignCatalog campaigns,
+    IResourceDirectory resources,
     IAchievementDirectory achievements,
     IAuditLog audit,
     IUnitOfWork uow,
@@ -383,8 +384,16 @@ public sealed class CampaignContentService(
     public async Task<Page<TaskRec>> ListTasksAsync(ActorContext actor, Guid streamId, int limit, string? cursor, CancellationToken ct)
     {
         var stream = await campaigns.GetStreamAsync(actor.CompanyId, streamId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
-        await EnsureContentVisibleAsync(actor, stream.CampaignId, ct);
-        return await campaigns.ListTasksAsync(actor.CompanyId, streamId, limit, cursor, ct);
+        var employee = await EnsureContentVisibleAsync(actor, stream.CampaignId, ct);
+        var campaign = await campaigns.GetAsync(actor.CompanyId, stream.CampaignId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
+        if (actor.IsAdmin || campaign.OwnerMasterId == actor.MasterId)
+        {
+            return await campaigns.ListTasksAsync(actor.CompanyId, streamId, limit, cursor, ct);
+        }
+
+        // B11: the task audience governs lists exactly as detail; the store walks its ordering
+        // and the returned page contains only tasks visible to this reader.
+        return await campaigns.ListVisibleTasksAsync(actor.CompanyId, streamId, employee.Tags, limit, cursor, ct);
     }
 
     public async Task<MilestoneRec> GetMilestoneAsync(ActorContext actor, Guid milestoneId, CancellationToken ct)
@@ -415,9 +424,10 @@ public sealed class CampaignContentService(
         return await campaigns.ListChallengesAsync(actor.CompanyId, campaignId, limit, cursor, ct);
     }
 
-    /// <summary>Content of a published campaign is visible to its current audience only — list
-    /// and detail alike; drafts are owner/admin only; every reader must be active (B09.2, B11, B05).</summary>
-    private async Task EnsureContentVisibleAsync(ActorContext actor, Guid campaignIdOrStreamId, CancellationToken ct, bool byStream = false)
+    /// <summary>Content visibility is the campaign rule (B09.2, B11, B05): active profile,
+    /// owner/admin unrestricted, drafts hidden, published content within the campaign
+    /// audience. The single decision lives in <see cref="CampaignsService.EnsureVisibleAsync"/>.</summary>
+    private async Task<EmployeeRec> EnsureContentVisibleAsync(ActorContext actor, Guid campaignIdOrStreamId, CancellationToken ct, bool byStream = false)
     {
         Guid campaignId;
         if (byStream)
@@ -432,26 +442,7 @@ public sealed class CampaignContentService(
         }
 
         var campaign = await campaigns.GetAsync(actor.CompanyId, campaignId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
-        if (campaign.Status == CampaignStatus.Deleted)
-        {
-            throw new MotivaException(ErrorCode.NotFound);
-        }
-
-        var employee = await rights.EnsureActiveEmployeeAsync(actor, ct);
-        if (actor.IsAdmin || campaign.OwnerMasterId == actor.MasterId)
-        {
-            return;
-        }
-
-        if (campaign.Status == CampaignStatus.Draft)
-        {
-            throw new MotivaException(ErrorCode.NotFound);
-        }
-
-        if (!campaign.Audience.Matches(new HashSet<string>(employee.Tags)))
-        {
-            throw new MotivaException(ErrorCode.AuthzForbidden, "The content is outside your audience.");
-        }
+        return await campaignsService.EnsureVisibleAsync(actor, campaign, ct);
     }
 
     private async Task<CampaignRec> GetCampaignAsync(ActorContext actor, Guid campaignId, CancellationToken ct)
@@ -496,6 +487,14 @@ public sealed class CampaignContentService(
         if (distinct.Any(id => !campaignResourceIds.Contains(id)))
         {
             throw new MotivaException(ErrorCode.ValidationFailed, "Reward resources must be part of the campaign set.");
+        }
+
+        // B07: an archived resource never enters NEW reward settings — task create and patch
+        // alike. Historical rewards keep paying; only new configuration is closed.
+        var rows = await resources.ListByIdsAsync(actor.CompanyId, distinct, ct);
+        if (rows.Count != distinct.Length || rows.Any(r => r.Status != ResourceStatus.Active))
+        {
+            throw new MotivaException(ErrorCode.ValidationFailed, "Reward resources must be active (non-archived) company resources.");
         }
 
         return rewardItems.Select(i => new RewardItemRec(i.ResourceId, i.Amount)).ToArray();

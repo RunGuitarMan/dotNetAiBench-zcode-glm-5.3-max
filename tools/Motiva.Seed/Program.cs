@@ -260,4 +260,28 @@ await Parallel.ForAsync(0, 100_000, new ParallelOptions { MaxDegreeOfParallelism
     }
 });
 Console.WriteLine($"[seed] 100k movements in {awardWatch.Elapsed.TotalSeconds:F0}s");
+
+// T09 two-competitor pair: a DEDICATED published campaign whose task rewards exactly the whole
+// remaining budget — two parallel completions race for the last unit (goal 3 → delta 3, reward
+// 10, budget exactly 10). A fresh code per run keeps the remainder reproducible (E04 under load).
+var raceCode = "SEEDRACE" + DateTime.UtcNow.ToString("MMddHHmmss");
+var raceCreate = await campaignsService.CreateAsync(admin, raceCode, "Race pair", null, 1, seasonStart, seasonEnd, null, "seed-race-" + raceCode, CancellationToken.None);
+Ok(raceCreate.Status, "race campaign create");
+var raceCampaignId = Id(raceCreate.Body);
+await campaignsService.PutResourcesAsync(admin, raceCampaignId, ETags.Format(1), [resourceIds[0]], CancellationToken.None);
+var raceStream = await content.CreateStreamAsync(admin, raceCampaignId, "S1", "Race stream", "seed-race-s", CancellationToken.None);
+Ok(raceStream.Status, "race stream create");
+var raceTask = await content.CreateTaskAsync(
+    admin, Id(raceStream.Body), "TR", "Race task", null, 3, Motiva.Domain.Periods.PeriodKind.Day, 0,
+    new[] { new Motiva.Application.Dto.RewardItemDto(resourceIds[0], 10L) }, null, "seed-race-t", CancellationToken.None);
+Ok(raceTask.Status, "race task create");
+var raceBudget = await Resolve<BudgetService>().AllocateAsync(admin, raceCampaignId, resourceIds[0], 10, null, "SEED-RACE-BUDGET-" + raceCode, CancellationToken.None);
+Ok(raceBudget.Status, "race budget allocate (exactly the reward — the last remainder)");
+var raceGrant = await Resolve<IntegrationGrantsService>().CreateAsync(admin, "progress-source", GrantKind.Progress, raceCampaignId, null, null, "seed-race-g", CancellationToken.None);
+if (raceGrant.Status != 201 && !raceGrant.Body.Contains("already"))
+{
+    Ok(raceGrant.Status, "race progress grant");
+}
+
+Console.WriteLine($"[seed] race pair ready: campaign {raceCode}, task goal 3, reward 10, budget remainder exactly 10");
 Console.WriteLine($"[seed] complete in {watch.Elapsed.TotalSeconds:F0}s");

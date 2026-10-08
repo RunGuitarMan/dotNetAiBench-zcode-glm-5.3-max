@@ -3,9 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 GROUP="${1:-all}"
-export Motiva__PostgresConnectionString="${Motiva__PostgresConnectionString:-${MOTIVA_PG:-Host=localhost;Port=5433;Database=motiva;Username=motiva;Password=motiva-stand}"
-export Motiva__ValkeyEndpoint="${Motiva__ValkeyEndpoint:-${MOTIVA_VALKEY:-localhost:6380}"
-export Motiva__S3ServiceUrl="${Motiva__S3ServiceUrl:-${MOTIVA_S3:-http://localhost:9100}"
+export Motiva__PostgresConnectionString="${Motiva__PostgresConnectionString:-${MOTIVA_PG:-Host=localhost;Port=5433;Database=motiva;Username=motiva;Password=motiva-stand}}"
+export Motiva__ValkeyEndpoint="${Motiva__ValkeyEndpoint:-${MOTIVA_VALKEY:-localhost:6380}}"
+export Motiva__S3ServiceUrl="${Motiva__S3ServiceUrl:-${MOTIVA_S3:-http://localhost:9100}}"
 export Motiva__S3AccessKey="motiva"
 export Motiva__S3SecretKey="motiva-stand-secret"
 export Motiva__S3Bucket="motiva-exports"

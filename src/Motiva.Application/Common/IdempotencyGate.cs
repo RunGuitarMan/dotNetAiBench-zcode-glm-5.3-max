@@ -41,7 +41,8 @@ public sealed class IdempotencyGate(IIdempotencyStore store)
     }
 
     /// <summary>Rebuilds the creation Location from the stored representation: a successful
-    /// replay keeps the full contract of the original 201 (T04).</summary>
+    /// replay keeps the full contract of the original 201 (T04). Creates identify their object
+    /// by a string/number <c>id</c> or, for employees, by the numeric <c>masterId</c>.</summary>
     private static string? LocationOf(string? body)
     {
         if (string.IsNullOrEmpty(body))
@@ -52,9 +53,13 @@ public sealed class IdempotencyGate(IIdempotencyStore store)
         try
         {
             using var document = System.Text.Json.JsonDocument.Parse(body);
-            if (document.RootElement.TryGetProperty("id", out var id) && id.ValueKind == System.Text.Json.JsonValueKind.String)
+            foreach (var property in new[] { "id", "masterId" })
             {
-                return id.GetString();
+                if (document.RootElement.TryGetProperty(property, out var value)
+                    && (value.ValueKind is System.Text.Json.JsonValueKind.String or System.Text.Json.JsonValueKind.Number))
+                {
+                    return value.ToString();
+                }
             }
         }
         catch (System.Text.Json.JsonException)

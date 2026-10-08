@@ -61,7 +61,7 @@ public sealed class ExportTests(MotivaFunctionalFixture fixture)
 
         // 10:05 first successful formation: the snapshot includes both movements.
         fixture.Host.Clock.SetUtcNow(new DateTimeOffset(2026, 6, 1, 10, 5, 0, TimeSpan.Zero));
-        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None);
+        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None); // bool result: true = finished
         var state = await exports.GetAsync(world.Employee(1200), exportId, CancellationToken.None);
         Assert.Equal(ExportStatus.Ready, state.Status);
 
@@ -95,10 +95,10 @@ public sealed class ExportTests(MotivaFunctionalFixture fixture)
         fixture.Host.Impediments.PauseOn(Checkpoints.ManualAwardBeforeCommit);
         var lateAward = Task.Run(() => world.Resolve<ManualAwardsService>().AwardAsync(
             world.Admin, campaignId, 1200, a, 7, "late commit", "MA-LATE", CancellationToken.None));
-        await Task.Delay(300); // the award row exists with createdAt 10:02 but is not committed
+        await fixture.Host.Impediments.WaitReachedAsync(Checkpoints.ManualAwardBeforeCommit); // the award holds its open transaction
 
         fixture.Host.Clock.SetUtcNow(new DateTimeOffset(2026, 6, 1, 10, 5, 0, TimeSpan.Zero));
-        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None);
+        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None); // bool result: true = finished
         fixture.Host.Impediments.Release(Checkpoints.ManualAwardBeforeCommit);
         await lateAward;
 
@@ -119,29 +119,115 @@ public sealed class ExportTests(MotivaFunctionalFixture fixture)
         var order = await exports.CreateAsync(world.Employee(1200), ExportScope.Own, null, a, from, to, "exp-c2", CancellationToken.None);
         var exportId = Guid.Parse(TestWorld.ParseJson(order.Body).GetProperty("id").GetString()!);
 
-        // Worker A runs the REAL handler path and dies (pause) after its upload; the lease is
-        // 60 s of wall/service time — the fake clock advances past it deterministically.
-        fixture.Host.Impediments.PauseOn(Checkpoints.ExportAfterUploadBeforeReady);
+        // Worker A runs the REAL handler path and stops (hard pause) after its upload; the lease
+        // is 60 s of service time — the fake clock advances past it deterministically. The pause
+        // is one-shot: only A stops there, worker B passes through — B's Ready provably happens
+        // BEFORE A resumes.
+        fixture.Host.Impediments.PauseFirstOn(Checkpoints.ExportAfterUploadBeforeReady);
         var workerA = Task.Run(() => world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None));
-        await Task.Delay(300); // A holds Forming(gen=1) with its upload done
+        await fixture.Host.Impediments.WaitReachedAsync(Checkpoints.ExportAfterUploadBeforeReady); // A: upload done, pre-Ready
 
         // Lease expiry by the service clock: worker B takes over through the same handler path.
         fixture.Host.Clock.Advance(TimeSpan.FromSeconds(61));
-        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None);
+        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None); // bool result: true = finished
         var winner = await exports.GetAsync(world.Employee(1200), exportId, CancellationToken.None);
         Assert.Equal(ExportStatus.Ready, winner.Status);
         Assert.Equal(2, winner.Generation);
 
-        // Worker A resumes and CANNOT overwrite the winner: Ready CAS by generation fails.
+        // ONLY NOW is worker A released; it CANNOT overwrite the winner: the Ready CAS by
+        // generation fails and the losing attempt's object is removed by the winner.
         fixture.Host.Impediments.Release(Checkpoints.ExportAfterUploadBeforeReady);
         await workerA;
         var afterStale = await exports.GetAsync(world.Employee(1200), exportId, CancellationToken.None);
         Assert.Equal(ExportStatus.Ready, afterStale.Status);
         Assert.Equal(2, afterStale.Generation);
 
-        // The winner's bytes are what downloads return (§3.6: unique per-attempt keys).
+        // The winner's bytes are what downloads return; the stale gen-1 object is gone (§3.6).
         var csv = await DownloadAsync(world, winner);
         Assert.StartsWith("operationId,masterId", csv);
+        var storage = world.Resolve<IFileStorage>();
+        Assert.False(await storage.ExistsAsync(ExportsService.S3Key(exportId, 1), CancellationToken.None));
+        Assert.True(await storage.ExistsAsync(ExportsService.S3Key(exportId, 2), CancellationToken.None));
+    }
+
+    /// <summary>S-3 exact trace of the R1 review: the worker completes its upload and stops
+    /// before Ready; the export is deleted; a cleanup sweep runs DURING the live lease (must
+    /// not clear the intent); the worker then fails after the upload; the sweep after the lease
+    /// expiry still removes the uploaded object — the guarantee never depends on the late
+    /// worker finishing successfully.</summary>
+    [Fact]
+    public async Task d11_delete_during_upload_then_worker_failure_still_cleans_bytes()
+    {
+        var (world, a, campaignId) = await ArrangeHistoryAsync();
+        var exports = world.Resolve<ExportsService>();
+        var from = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var to = new DateTimeOffset(2026, 12, 31, 0, 0, 0, TimeSpan.Zero);
+        fixture.Host.Clock.SetUtcNow(new DateTimeOffset(2026, 6, 1, 10, 0, 0, TimeSpan.Zero));
+        var order = await exports.CreateAsync(world.Employee(1200), ExportScope.Own, null, a, from, to, "exp-d11a", CancellationToken.None);
+        var exportId = Guid.Parse(TestWorld.ParseJson(order.Body).GetProperty("id").GetString()!);
+
+        // The worker passes the pre-upload check, uploads its bytes and pauses before Ready.
+        fixture.Host.Impediments.PauseOn(Checkpoints.ExportAfterUploadBeforeReady);
+        var worker = Task.Run(() => world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None));
+        await fixture.Host.Impediments.WaitReachedAsync(Checkpoints.ExportAfterUploadBeforeReady);
+        var storage = world.Resolve<IFileStorage>();
+        Assert.True(await storage.ExistsAsync(ExportsService.S3Key(exportId, 1), CancellationToken.None)); // the upload is real
+
+        // The export is deleted and a cleanup sweep runs while the formation lease is live:
+        // the intent must SURVIVE, otherwise the already-uploaded bytes would be orphaned.
+        await exports.DeleteAsync(world.Employee(1200), exportId, CancellationToken.None);
+        await world.Resolve<CleanupHandler>().SweepAsync(CancellationToken.None);
+        var duringLease = await world.Resolve<IExportStore>().LoadAsync(exportId, CancellationToken.None);
+        Assert.True(duringLease!.CleanupIntent);
+        Assert.True(await storage.ExistsAsync(ExportsService.S3Key(exportId, 1), CancellationToken.None));
+
+        // The late worker fails after the upload (crash before Ready); after the lease expiry
+        // the sweep removes its object with no help from the worker: no bytes, no intent (§3.6).
+        fixture.Host.Impediments.FailOn(Checkpoints.ExportAfterUploadBeforeReady);
+        fixture.Host.Impediments.Release(Checkpoints.ExportAfterUploadBeforeReady);
+        await Assert.ThrowsAsync<ImpedimentFailureException>(() => worker);
+        fixture.Host.Clock.Advance(TimeSpan.FromSeconds(61));
+        await world.Resolve<CleanupHandler>().SweepAsync(CancellationToken.None);
+        var final = await world.Resolve<IExportStore>().LoadAsync(exportId, CancellationToken.None);
+        Assert.Equal(ExportStatus.Deleted, final!.Status);
+        Assert.False(final.CleanupIntent);
+        Assert.False(await storage.ExistsAsync(ExportsService.S3Key(exportId, 1), CancellationToken.None));
+        Assert.False(await storage.ExistsAsync(ExportsService.S3Key(exportId, 2), CancellationToken.None));
+    }
+
+    /// <summary>A worker frozen mid-formation (pause of the whole seam, lease kept alive by the
+    /// worker's clock) is fenced: after the deletion it aborts its own upload instead of
+    /// writing bytes a settled cleanup would not know about.</summary>
+    [Fact]
+    public async Task d11_frozen_worker_aborts_upload_after_delete()
+    {
+        var (world, a, campaignId) = await ArrangeHistoryAsync();
+        var exports = world.Resolve<ExportsService>();
+        var from = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var to = new DateTimeOffset(2026, 12, 31, 0, 0, 0, TimeSpan.Zero);
+        fixture.Host.Clock.SetUtcNow(new DateTimeOffset(2026, 6, 1, 10, 0, 0, TimeSpan.Zero));
+        var order = await exports.CreateAsync(world.Employee(1200), ExportScope.Own, null, a, from, to, "exp-d11b", CancellationToken.None);
+        var exportId = Guid.Parse(TestWorld.ParseJson(order.Body).GetProperty("id").GetString()!);
+
+        fixture.Host.Impediments.PauseOn(Checkpoints.ExportDuringUpload);
+        var worker = Task.Run(() => world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None));
+        await fixture.Host.Impediments.WaitReachedAsync(Checkpoints.ExportDuringUpload);
+
+        // Deletion overtakes the frozen worker; it stays paused well past its lease.
+        await exports.DeleteAsync(world.Employee(1200), exportId, CancellationToken.None);
+        fixture.Host.Clock.Advance(TimeSpan.FromSeconds(120));
+        await world.Resolve<CleanupHandler>().SweepAsync(CancellationToken.None);
+
+        // The zombie worker resumes: the per-part fence rejects the upload (row deleted) —
+        // the multipart upload is aborted, no object is ever completed.
+        fixture.Host.Impediments.Release(Checkpoints.ExportDuringUpload);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => worker);
+        var storage = world.Resolve<IFileStorage>();
+        Assert.False(await storage.ExistsAsync(ExportsService.S3Key(exportId, 1), CancellationToken.None));
+        Assert.False(await storage.ExistsAsync(ExportsService.S3Key(exportId, 2), CancellationToken.None));
+        var final = await world.Resolve<IExportStore>().LoadAsync(exportId, CancellationToken.None);
+        Assert.Equal(ExportStatus.Deleted, final!.Status);
+        Assert.False(final.CleanupIntent); // the post-expiry sweep settled the intent
     }
 
     [Fact]
@@ -154,7 +240,7 @@ public sealed class ExportTests(MotivaFunctionalFixture fixture)
         fixture.Host.Clock.SetUtcNow(new DateTimeOffset(2026, 6, 1, 10, 0, 0, TimeSpan.Zero));
         var order = await exports.CreateAsync(world.Employee(1200), ExportScope.Own, null, a, from, to, "exp-c3", CancellationToken.None);
         var exportId = Guid.Parse(TestWorld.ParseJson(order.Body).GetProperty("id").GetString()!);
-        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None);
+        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None); // bool result: true = finished
         var state = await exports.GetAsync(world.Employee(1200), exportId, CancellationToken.None);
         Assert.Equal(ExportStatus.Ready, state.Status);
 
@@ -168,12 +254,18 @@ public sealed class ExportTests(MotivaFunctionalFixture fixture)
         await Assert.ThrowsAsync<MotivaException>(() =>
             exports.CreateDownloadLinkAsync(world.Employee(1200), exportId, "link-key", CancellationToken.None));
 
-        // The cleanup sweep removes the bytes of every generation; no resurrection.
+        // The sweep during the live formation lease keeps the intent (bytes may still be
+        // written); after the lease expiry it removes the bytes of every generation for good.
+        await world.Resolve<CleanupHandler>().SweepAsync(CancellationToken.None);
+        var stillDeletedRow = await world.Resolve<IExportStore>().LoadAsync(exportId, CancellationToken.None);
+        Assert.True(stillDeletedRow!.CleanupIntent);
+        fixture.Host.Clock.Advance(TimeSpan.FromSeconds(61));
         await world.Resolve<CleanupHandler>().SweepAsync(CancellationToken.None);
         var storage = world.Resolve<IFileStorage>();
         Assert.False(await storage.ExistsAsync(ExportsService.S3Key(exportId, state.Generation), CancellationToken.None));
         var stillDeleted = await world.Resolve<IExportStore>().LoadAsync(exportId, CancellationToken.None);
         Assert.Equal(ExportStatus.Deleted, stillDeleted!.Status);
+        Assert.False(stillDeleted.CleanupIntent);
     }
 
     [Fact]
@@ -186,7 +278,7 @@ public sealed class ExportTests(MotivaFunctionalFixture fixture)
         fixture.Host.Clock.SetUtcNow(new DateTimeOffset(2026, 6, 1, 10, 0, 0, TimeSpan.Zero));
         var order = await exports.CreateAsync(world.Employee(1200), ExportScope.Own, null, a, from, to, "exp-dl", CancellationToken.None);
         var exportId = Guid.Parse(TestWorld.ParseJson(order.Body).GetProperty("id").GetString()!);
-        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None);
+        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None); // bool result: true = finished
 
         var link = await exports.CreateDownloadLinkAsync(world.Employee(1200), exportId, "dl-key", CancellationToken.None);
         var linkBody = TestWorld.ParseJson(link.Body);
@@ -221,7 +313,7 @@ public sealed class ExportTests(MotivaFunctionalFixture fixture)
 
         var order = await exports.CreateAsync(world.Employee(1200), ExportScope.Own, null, null, from, to, "exp-csv", CancellationToken.None);
         var exportId = Guid.Parse(TestWorld.ParseJson(order.Body).GetProperty("id").GetString()!);
-        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None);
+        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None); // bool result: true = finished
         var state = await exports.GetAsync(world.Employee(1200), exportId, CancellationToken.None);
         var csv = await DownloadAsync(world, state);
         var lines = csv.Split('\n', StringSplitOptions.RemoveEmptyEntries).ToList();

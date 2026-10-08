@@ -72,6 +72,10 @@ public interface IFileStorage
 
     Task DeletePrefixAsync(string prefix, CancellationToken ct);
 
+    /// <summary>Removes every object and incomplete multipart upload under the prefix except
+    /// the kept key — the winning export attempt clears the objects of losing attempts.</summary>
+    Task DeleteOthersAsync(string prefix, string keepKey, CancellationToken ct);
+
     Task<string> ComputeChecksumAsync(string key, CancellationToken ct);
 
     Task<long> GetSizeAsync(string key, CancellationToken ct);

@@ -7,8 +7,9 @@ namespace Motiva.Api.Infrastructure;
 
 /// <summary>Problem Details (RFC 9457) with a constant machine-readable code and traceId;
 /// 401 from the authentication handler also becomes a proper body (stage-2 §4.2). No tokens,
-/// keys or signed URLs ever leak into the payload.</summary>
-public sealed class ProblemDetailsMiddleware(RequestDelegate next, ILogger<ProblemDetailsMiddleware> logger)
+/// keys or signed URLs ever leak into the payload. Latency/status observations go through the
+/// application-level <see cref="IRequestMetrics"/> seam — no Infrastructure reference (L01).</summary>
+public sealed class ProblemDetailsMiddleware(RequestDelegate next, IRequestMetrics metrics, ILogger<ProblemDetailsMiddleware> logger)
 {
     public async Task InvokeAsync(HttpContext context)
     {
@@ -18,12 +19,12 @@ public sealed class ProblemDetailsMiddleware(RequestDelegate next, ILogger<Probl
             await next(context);
             // Framework-produced empty error responses (model binding, auth) become Problem
             // Details with a constant code and traceId — the contract never returns bare 4xx (T04).
-            Motiva.Infrastructure.MotivaMetrics.ObserveRequest(
+            metrics.ObserveRequest(
                 context.Request.Method == "GET" || context.Request.Method == "HEAD" ? "read" : "write",
                 stopwatch.Elapsed.TotalMilliseconds);
             if (context.Response.StatusCode >= 400)
             {
-                Motiva.Infrastructure.MotivaMetrics.Count("http:status:" + context.Response.StatusCode);
+                metrics.Count("http:status:" + context.Response.StatusCode);
             }
 
             if (context.Response.StatusCode >= 400 && !context.Response.HasStarted && context.Response.ContentLength is null)
@@ -43,11 +44,11 @@ public sealed class ProblemDetailsMiddleware(RequestDelegate next, ILogger<Probl
         }
         catch (MotivaException ex)
         {
-            Motiva.Infrastructure.MotivaMetrics.ObserveRequest(
+            metrics.ObserveRequest(
                 context.Request.Method == "GET" || context.Request.Method == "HEAD" ? "read" : "write",
                 stopwatch.Elapsed.TotalMilliseconds);
-            Motiva.Infrastructure.MotivaMetrics.Count("http:status:" + MotivaException.HttpStatusOf(ex.Code));
-            Motiva.Infrastructure.MotivaMetrics.Count("errors:business:" + MotivaException.StringCodeOf(ex.Code));
+            metrics.Count("http:status:" + MotivaException.HttpStatusOf(ex.Code));
+            metrics.Count("errors:business:" + MotivaException.StringCodeOf(ex.Code));
             var status = MotivaException.HttpStatusOf(ex.Code);
             if (status == 503)
             {

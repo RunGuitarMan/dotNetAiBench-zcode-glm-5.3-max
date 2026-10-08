@@ -1,48 +1,40 @@
-// T09 degradation pass: the SAME business mix keeps running while dependencies fail;
-// the run records the actual degradation (checks may fail only while a dependency is down
-// and the service must recover without manual action).
-import http from 'k6/http';
-import { check, sleep } from 'k6';
-import { Counter } from 'k6/metrics';
+// T09 degradation pass (D15): the SAME 100 RPS profile and the SAME five-branch mix as the
+// main run keep executing while dependencies fail (Valkey 30 s, S3 30 s, one API 10 s —
+// orchestrated by scripts/load.sh). No hard thresholds here: this pass documents the actual
+// degradation and the recovery; the correctness gates live in main.js.
+import { makeRng, runMix, goodputRate } from './mix.js';
 
-const BASE = __ENV.BASE_URL || 'http://lb';
-const EMP = __ENV.EMP_TOKEN;
-const SRC = __ENV.SRC_TOKEN;
-const TASKS = (__ENV.TASK_IDS || '').split(',').filter(Boolean);
-const failed = new Counter('motiva_failed_requests');
+const env = {
+  BASE: __ENV.BASE_URL || 'http://lb',
+  EMP: __ENV.EMP_TOKEN,
+  SRC: __ENV.SRC_TOKEN,
+  SHOP: __ENV.SHOP_TOKEN,
+  CAMPAIGNS: (__ENV.CAMPAIGN_IDS || '').split(',').filter(Boolean),
+  TASKS: (__ENV.TASK_IDS || '').split(',').filter(Boolean),
+  CHALLENGES: (__ENV.CHALLENGE_IDS || '').split(',').filter(Boolean),
+  SYSTEM_ID: __ENV.PURCHASE_SYSTEM_ID,
+  RESOURCE_ID: __ENV.RESOURCE_ID,
+  EMPLOYEES: Number(__ENV.EMPLOYEE_MAX || 10002),
+};
 
 export const options = {
   scenarios: {
     degradation: {
-      executor: 'constant-arrival-rate',
-      rate: 50,
+      executor: 'ramping-arrival-rate',
+      startRate: 1,
       timeUnit: '1s',
-      duration: '120s',
-      preAllocatedVUs: 30,
-      maxVUs: 100,
+      preAllocatedVUs: 50,
+      maxVUs: 200,
+      stages: [
+        { target: 100, duration: '60s' },   // same warmup shape as the main profile
+        { target: 100, duration: '300s' },  // the outage windows fall inside this stage
+      ],
+      exec: 'mix',
     },
   },
-  // No hard thresholds: this pass documents the degradation profile, the gates live in main.js.
 };
 
 export default function () {
-  const dice = Math.random();
-  if (dice < 0.6) {
-    const r = http.get(BASE + '/api/v1/resources', { headers: { Authorization: 'Bearer ' + EMP }, tags: { kind: 'read' } });
-    check(r, { 'catalog 200': (res) => res.status === 200 }) || failed.add(1);
-  } else if (dice < 0.9) {
-    const r = http.get(BASE + '/api/v1/me/wallet', { headers: { Authorization: 'Bearer ' + EMP }, tags: { kind: 'read' } });
-    check(r, { 'wallet 200': (res) => res.status === 200 }) || failed.add(1);
-  } else {
-    const body = JSON.stringify({
-      eventNumber: 'DEG-' + Date.now() + '-' + Math.floor(Math.random() * 1e9),
-      masterId: 2 + Math.floor(Math.random() * 10000),
-      taskId: TASKS[Math.floor(Math.random() * TASKS.length)],
-      delta: 1,
-    });
-    const r = http.post(BASE + '/api/v1/progress-events', body,
-      { headers: { Authorization: 'Bearer ' + SRC, 'Content-Type': 'application/json' }, tags: { kind: 'write' } });
-    check(r, { 'event 201': (res) => res.status === 201 }) || failed.add(1);
-  }
-  sleep(0.05);
+  const rng = makeRng(Number(__ENV.SEED || 42) + (__VU - 1) * 7919 + 104729);
+  runMix(env, rng);
 }

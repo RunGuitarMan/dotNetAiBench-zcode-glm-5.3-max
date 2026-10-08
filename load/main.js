@@ -1,31 +1,20 @@
 // T09 open-model load profile: 100 RPS, 60 s warmup + 300 s measurement.
-// Mix: 50% catalog, 25% own wallet, 10% live leaderboard, 10% new progress events,
-// 5% new spends (1 unit). Routes follow docs/openapi.yaml.
-import http from 'k6/http';
-import { check, sleep } from 'k6';
-import { Counter, Trend } from 'k6/metrics';
+// The mix (50/25/10/10/5) and the seeded PRNG live in mix.js — shared with the degradation
+// pass so the profile cannot drift between them (D15).
+import { makeRng, runMix, goodputRate, failed } from './mix.js';
 
-const BASE = __ENV.BASE_URL || 'http://lb';
-const EMP = __ENV.EMP_TOKEN;
-const SRC = __ENV.SRC_TOKEN;
-const SHOP = __ENV.SHOP_TOKEN;
-const CAMPAIGNS = (__ENV.CAMPAIGN_IDS || '').split(',').filter(Boolean);
-const TASKS = (__ENV.TASK_IDS || '').split(',').filter(Boolean);
-const SYSTEM_ID = __ENV.PURCHASE_SYSTEM_ID;
-const RESOURCE_ID = __ENV.RESOURCE_ID;
-const EMPLOYEES = Number(__ENV.EMPLOYEE_MAX || 10002);
-
-const failed = new Counter('motiva_failed_requests');
-const businessWrong = new Counter('motiva_business_wrong');
-const CHALLENGES = (__ENV.CHALLENGE_IDS || '').split(',').filter(Boolean);
-const START_MS = Date.now();
-
-// The measurement window starts after the 60 s warmup stage; every request is tagged so the
-// summary separates warmup from measurement (T09: 60 s прогрев + 300 с измерение).
-function tags(kind) {
-  const measurement = Date.now() - START_MS >= 60000;
-  return { kind: kind, phase: measurement ? 'measure' : 'warmup' };
-}
+const env = {
+  BASE: __ENV.BASE_URL || 'http://lb',
+  EMP: __ENV.EMP_TOKEN,
+  SRC: __ENV.SRC_TOKEN,
+  SHOP: __ENV.SHOP_TOKEN,
+  CAMPAIGNS: (__ENV.CAMPAIGN_IDS || '').split(',').filter(Boolean),
+  TASKS: (__ENV.TASK_IDS || '').split(',').filter(Boolean),
+  CHALLENGES: (__ENV.CHALLENGE_IDS || '').split(',').filter(Boolean),
+  SYSTEM_ID: __ENV.PURCHASE_SYSTEM_ID,
+  RESOURCE_ID: __ENV.RESOURCE_ID,
+  EMPLOYEES: Number(__ENV.EMPLOYEE_MAX || 10002),
+};
 
 export const options = {
   scenarios: {
@@ -46,69 +35,15 @@ export const options = {
     'http_req_failed{phase:measure}': ['rate<0.005'],
     'http_req_duration{kind:read,phase:measure}': ['p(95)<200', 'p(99)<1000'],
     'http_req_duration{kind:write,phase:measure}': ['p(95)<500', 'p(99)<1000'],
+    // Goodput is a first-class gate: ≥ 99.5 % of requests return the correct business result
+    // within 1 s (T09), counted per request — not per check.
+    goodputRate: ['rate>=0.995'],
+    failed: ['count<1'],
   },
 };
 
-const headersFor = (token) => ({ Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' });
-
-export default function () { mix(); }
-
-export function mix() {
-  const dice = Math.random();
-  if (dice < 0.50) {
-    // catalog: employee-visible resources (Valkey 30 s snapshot or PG fallback)
-    const r = http.get(BASE + '/api/v1/resources', { headers: headersFor(EMP), tags: tags('read') });
-    check(r, { 'catalog 200': (res) => res.status === 200 }) || failed.add(1);
-  } else if (dice < 0.75) {
-    const r = http.get(BASE + '/api/v1/me/wallet', { headers: headersFor(EMP), tags: tags('read') });
-    check(r, { 'wallet 200': (res) => res.status === 200 }) || failed.add(1);
-  } else if (dice < 0.85) {
-    if (CHALLENGES.length === 0) {
-      // Fail loudly rather than silently dropping the 10% branch (adapter verification, D15).
-      businessWrong.add(1);
-      failed.add(1);
-      sleep(0.05);
-      return;
-    }
-    const challenge = CHALLENGES[Math.floor(Math.random() * CHALLENGES.length)];
-    const r = http.get(BASE + '/api/v1/challenges/' + challenge + '/leaderboard?limit=10', { headers: headersFor(EMP), tags: tags('read') });
-    check(r, { 'leaderboard 200': (res) => res.status === 200 }) || failed.add(1);
-  } else if (dice < 0.95) {
-    const task = TASKS[Math.floor(Math.random() * TASKS.length)];
-    const masterId = 2 + Math.floor(Math.random() * EMPLOYEES);
-    const body = JSON.stringify({
-      eventNumber: 'LOAD-' + Date.now() + '-' + Math.floor(Math.random() * 1e9),
-      masterId: masterId,
-      taskId: task,
-      delta: 1,
-    });
-    const r = http.post(BASE + '/api/v1/progress-events', body, { headers: headersFor(SRC), tags: tags('write') });
-    // 201 is the transport result; the business result must be Accepted for the seeded audience.
-    check(r, {
-      'event 201': (res) => res.status === 201,
-      'event Accepted': (res) => res.status === 201 && JSON.parse(res.body).result === 'Accepted',
-    }) || (failed.add(1), businessWrong.add(1));
-  } else {
-    const viaShop = Math.random() < 0.5;
-    const body = {
-      purchaseSystemId: SYSTEM_ID,
-      resourceId: RESOURCE_ID,
-      amount: 1,
-      operationNumber: 'LOAD-S-' + Date.now() + '-' + Math.floor(Math.random() * 1e9),
-    };
-    if (viaShop) {
-      // A service spend names the wallet owner (B23.2).
-      body.masterId = 2 + Math.floor(Math.random() * EMPLOYEES);
-    }
-
-    const token = viaShop ? SHOP : EMP;
-    const r = http.post(BASE + '/api/v1/spends', JSON.stringify(body), { headers: headersFor(token), tags: tags('write') });
-    // The seeded wallets are topped up for 1-unit spends: the business result must be Posted.
-    check(r, {
-      'spend 201': (res) => res.status === 201,
-      'spend Posted': (res) => res.status === 201 && JSON.parse(res.body).result === 'Posted',
-    }) || (failed.add(1), businessWrong.add(1));
-  }
-  sleep(0.05);
+export default function () {
+  // One PRNG per VU, all seeded from the run-level SEED: the whole run is reproducible.
+  const rng = makeRng(Number(__ENV.SEED || 42) + (__VU - 1) * 7919);
+  runMix(env, rng);
 }
-

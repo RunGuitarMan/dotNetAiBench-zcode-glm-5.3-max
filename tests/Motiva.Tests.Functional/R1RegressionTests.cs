@@ -77,7 +77,7 @@ public sealed class AccessRightsR1Tests(MotivaFunctionalFixture fixture)
         var to = new DateTimeOffset(2026, 12, 31, 0, 0, 0, TimeSpan.Zero);
         var order = await exports.CreateAsync(world.Admin, ExportScope.Company, null, a, from, to, "x1", CancellationToken.None);
         var exportId = Guid.Parse(TestWorld.ParseJson(order.Body).GetProperty("id").GetString()!);
-        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None);
+        await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None); // bool result: true = finished
         var state = await exports.GetAsync(world.Admin, exportId, CancellationToken.None);
         Assert.Equal(ExportStatus.Ready, state.Status);
 
@@ -268,13 +268,15 @@ public sealed class AccessRightsR1Tests(MotivaFunctionalFixture fixture)
         // Worker A starts forming and pauses after the snapshot; delete arrives meanwhile.
         fixture.Host.Impediments.PauseOn(Checkpoints.ExportBeforeSnapshotCommit);
         var workerA = Task.Run(() => world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None));
-        await Task.Delay(300);
+        await fixture.Host.Impediments.WaitReachedAsync(Checkpoints.ExportBeforeSnapshotCommit);
         await exports.DeleteAsync(world.Employee(993), exportId, CancellationToken.None);
 
-        // Sweep during the race (the row is already Deleted) — then the late worker resumes.
+        // Sweep during the race (the row is already Deleted, but the lease is live) — then the
+        // late worker resumes.
         await world.Resolve<CleanupHandler>().SweepAsync(CancellationToken.None);
         fixture.Host.Impediments.Release(Checkpoints.ExportBeforeSnapshotCommit);
         await workerA;
+        fixture.Host.Clock.Advance(TimeSpan.FromSeconds(61)); // past the 60 s formation lease
         await world.Resolve<CleanupHandler>().SweepAsync(CancellationToken.None);
 
         // Invariants of the race: never Ready again, no bytes left behind, no pending intent (§3.6).

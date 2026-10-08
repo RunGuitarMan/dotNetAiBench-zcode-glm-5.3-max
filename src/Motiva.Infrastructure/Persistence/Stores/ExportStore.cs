@@ -89,7 +89,7 @@ public sealed class ExportStore(MotivaDbContext db, TimeProvider timeProvider) :
         }
 
         var generation = row.Generation + 1;
-        var frozenAt = DateTimeOffset.UtcNow;
+        var frozenAt = timeProvider.GetUtcNow();
         Guid[] operationIds;
         if (!row.SnapshotSaved)
         {
@@ -136,10 +136,12 @@ public sealed class ExportStore(MotivaDbContext db, TimeProvider timeProvider) :
 
     public Task<bool> TryExtendLeaseAsync(Guid companyId, Guid exportId, string leaseOwner, int expectedGeneration, CancellationToken ct)
     {
+        // The lease lives on the SERVICE clock (TimeProvider), never on wall time — tests move
+        // time deterministically and production uses the same source (§3.6).
         return db.ExportRequests
             .Where(e => e.Id == exportId && e.Generation == expectedGeneration
                         && e.LeaseOwner == leaseOwner && e.Status == "Forming")
-            .ExecuteUpdateAsync(s => s.SetProperty(e => e.LeaseUntil, DateTimeOffset.UtcNow.AddSeconds(60)), ct)
+            .ExecuteUpdateAsync(s => s.SetProperty(e => e.LeaseUntil, timeProvider.GetUtcNow().AddSeconds(60)), ct)
             .ContinueWith(t => t.Result > 0);
     }
 
@@ -191,10 +193,13 @@ public sealed class ExportStore(MotivaDbContext db, TimeProvider timeProvider) :
 
     public async Task<bool> HasLiveLeaseAsync(Guid exportId, DateTimeOffset utcNow, CancellationToken ct)
     {
+        // Liveness is the lease itself, NOT the row status: a deleted export may still have an
+        // in-flight formation under an unexpired lease. Cleanup that ignored the lease would
+        // clear the intent while a late upload can still write bytes (B37, §3.6).
         var row = await db.ExportRequests.Where(e => e.Id == exportId)
-            .Select(e => new { e.Status, e.LeaseUntil })
+            .Select(e => new { e.LeaseUntil })
             .FirstOrDefaultAsync(ct);
-        return row is { Status: "Forming" } && row.LeaseUntil is { } until && until > utcNow;
+        return row is { LeaseUntil: { } until } && until > utcNow;
     }
 
     public Task<IReadOnlyList<Guid>> GetSnapshotOperationIdsAsync(Guid exportId, CancellationToken ct)

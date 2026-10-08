@@ -259,13 +259,23 @@ public sealed class CampaignStore(MotivaDbContext db) : ICampaignCatalog
     public async Task<(UpdateOutcome, StreamRec?)> PatchStreamAsync(
         Guid companyId, Guid streamId, int expectedVersion, string? name, ContentStatus? status, CancellationToken ct)
     {
+        // §4.4: child mutations raise the aggregate version — every writer takes the campaign
+        // row lock BEFORE comparing versions, so one If-Match version yields exactly one
+        // successful transition (T04/T06).
+        var campaignId = await db.Streams.Where(s => s.Id == streamId).Select(s => (Guid?)s.CampaignId).FirstOrDefaultAsync(ct);
+        if (campaignId is null)
+        {
+            return (UpdateOutcome.NotFound, null);
+        }
+
+        await LockCampaignRowAsync(campaignId.Value, ct);
         var row = await db.Streams.FindAsync(new object[] { streamId }, ct);
         if (row is null)
         {
             return (UpdateOutcome.NotFound, null);
         }
 
-        var campaign = await db.Campaigns.FindAsync(new object[] { row.CampaignId }, ct);
+        var campaign = await db.Campaigns.FindAsync(new object[] { campaignId }, ct);
         if (campaign is null || campaign.CompanyId != companyId)
         {
             return (UpdateOutcome.NotFound, null);
@@ -318,6 +328,34 @@ public sealed class CampaignStore(MotivaDbContext db) : ICampaignCatalog
         return new Page<TaskRec>(items, next);
     }
 
+    public async Task<Page<TaskRec>> ListVisibleTasksAsync(
+        Guid companyId, Guid streamId, IReadOnlyCollection<string> readerTags, int limit, string? cursor, CancellationToken ct)
+    {
+        // Audience filtering with lossless pagination: keep walking store pages until `limit`
+        // visible tasks are collected or the stream ends; the returned cursor points right
+        // after the last returned task, so hidden tasks in between are skipped, not returned.
+        var tags = readerTags.ToHashSet();
+        var visible = new List<TaskRec>();
+        string? walk = cursor;
+        string? next = null;
+        while (true)
+        {
+            var page = await ListTasksAsync(companyId, streamId, limit + 1, walk, ct);
+            visible.AddRange(page.Items.Where(t => t.Audience.Matches(tags)));
+            next = page.NextCursor;
+            if (next is null || visible.Count > limit)
+            {
+                break;
+            }
+
+            walk = next;
+        }
+
+        var items = visible.Take(limit).ToList();
+        var boundary = items.Count < visible.Count ? CursorCodec.Encode(new CampaignCursor(items[^1].Code)) : null;
+        return new Page<TaskRec>(items, boundary);
+    }
+
     public async Task<(UpdateOutcome, TaskRec?)> CreateTaskAsync(
         Guid companyId, Guid id, Guid streamId, string codeNorm, string name, string? description, long goal,
         Domain.Periods.PeriodKind period, long streamPoints, IReadOnlyList<RewardItemRec> rewardItems, AudienceRule audience,
@@ -364,6 +402,17 @@ public sealed class CampaignStore(MotivaDbContext db) : ICampaignCatalog
         Domain.Periods.PeriodKind? period, long? streamPoints, IReadOnlyList<RewardItemRec>? rewardItems, AudienceRule? audience,
         ContentStatus? status, CancellationToken ct)
     {
+        // Aggregate row lock before the version compare (§4.4) — see PatchStreamAsync.
+        var campaignId = await (from t in db.Tasks
+                                join s in db.Streams on t.StreamId equals s.Id
+                                where t.Id == taskId
+                                select (Guid?)s.CampaignId).FirstOrDefaultAsync(ct);
+        if (campaignId is null)
+        {
+            return (UpdateOutcome.NotFound, null);
+        }
+
+        await LockCampaignRowAsync(campaignId.Value, ct);
         var row = await LoadTaskAsync(companyId, taskId, ct);
         if (row is null)
         {
@@ -488,6 +537,17 @@ public sealed class CampaignStore(MotivaDbContext db) : ICampaignCatalog
 
     public async Task<UpdateOutcome> DeleteMilestoneAsync(Guid companyId, Guid milestoneId, int expectedVersion, CancellationToken ct)
     {
+        // Aggregate row lock before the version compare (§4.4) — see PatchStreamAsync.
+        var campaignId = await (from m in db.Milestones
+                                join s in db.Streams on m.StreamId equals s.Id
+                                where m.Id == milestoneId
+                                select (Guid?)s.CampaignId).FirstOrDefaultAsync(ct);
+        if (campaignId is null)
+        {
+            return UpdateOutcome.NotFound;
+        }
+
+        await LockCampaignRowAsync(campaignId.Value, ct);
         var row = await db.Milestones.FindAsync(new object[] { milestoneId }, ct);
         if (row is null)
         {
@@ -559,6 +619,14 @@ public sealed class CampaignStore(MotivaDbContext db) : ICampaignCatalog
 
     public async Task<UpdateOutcome> DeleteChallengeAsync(Guid companyId, Guid challengeId, int expectedVersion, CancellationToken ct)
     {
+        // Aggregate row lock before the version compare (§4.4) — see PatchStreamAsync.
+        var campaignId = await db.Challenges.Where(ch => ch.Id == challengeId).Select(ch => (Guid?)ch.CampaignId).FirstOrDefaultAsync(ct);
+        if (campaignId is null)
+        {
+            return UpdateOutcome.NotFound;
+        }
+
+        await LockCampaignRowAsync(campaignId.Value, ct);
         var row = await db.Challenges.FindAsync(new object[] { challengeId }, ct);
         if (row is null)
         {
@@ -570,7 +638,7 @@ public sealed class CampaignStore(MotivaDbContext db) : ICampaignCatalog
             return UpdateOutcome.VersionMismatch;
         }
 
-        var campaign = await db.Campaigns.FindAsync(new object[] { row.CampaignId }, ct);
+        var campaign = await db.Campaigns.FindAsync(new object[] { campaignId }, ct);
         if (campaign is null || campaign.CompanyId != companyId)
         {
             return UpdateOutcome.NotFound;
