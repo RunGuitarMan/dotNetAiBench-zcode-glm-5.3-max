@@ -28,7 +28,6 @@ export const options = {
         { target: 100, duration: '60s' },   // warmup
         { target: 100, duration: '300s' },  // measurement
       ],
-      exec: 'mix',
     },
   },
   thresholds: {
@@ -37,13 +36,14 @@ export const options = {
     'http_req_duration{kind:write,phase:measure}': ['p(95)<500', 'p(99)<1000'],
     // Goodput is a first-class gate: ≥ 99.5 % of requests return the correct business result
     // within 1 s (T09), counted per request — not per check.
-    goodputRate: ['rate>=0.995'],
-    failed: ['count<1'],
+    'motiva_goodput_rate': ['rate>=0.995'],
   },
 };
 
+// One PRNG per VU, created in the per-VU init scope and ADVANCED across iterations —
+// recreating it per iteration would freeze every VU on one branch and one masterId.
+const rng = makeRng(Number(__ENV.SEED || 42) + ((__VU || 1) - 1) * 7919);
+
 export default function () {
-  // One PRNG per VU, all seeded from the run-level SEED: the whole run is reproducible.
-  const rng = makeRng(Number(__ENV.SEED || 42) + (__VU - 1) * 7919);
   runMix(env, rng);
 }

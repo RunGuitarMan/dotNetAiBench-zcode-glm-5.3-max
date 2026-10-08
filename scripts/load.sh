@@ -32,20 +32,32 @@ envs() { bash scripts/k6env.sh; }
 
 main() {
   echo "== k6 main profile (100 RPS open model, 60s warmup + 300s, seeded PRNG, goodput gate)"
+  date -u +%Y-%m-%dT%H:%M:%SZ > artifacts/load/main.started
   local args
   args=$(envs)
   sample_stats artifacts/load/stats-main.csv 380 &
   local stats_pid=$!
-  # k6 writes the machine summary to --summary-export (stdout) and the human log to stderr.
+  # k6 prints banner and human summary to stdout with the JSON export appended last; the
+  # JSON blob is extracted to its own file afterwards.
   # shellcheck disable=SC2086
   set +e
   docker compose run --rm $args k6 run --summary-export /dev/stdout /scripts/main.js \
-    > artifacts/load/main.summary.json 2> >(tee artifacts/load/main.log >&2)
+    > >(tee artifacts/load/main.log) 2>&1
   local k6_exit=$?
   set -e
+  python3 - <<'PY'
+import json, pathlib
+raw = pathlib.Path('artifacts/load/main.log').read_text()
+start = raw.rfind('\n{')
+try:
+    obj, _ = json.JSONDecoder().raw_decode(raw[start + 1:])
+    pathlib.Path('artifacts/load/main.summary.json').write_text(json.dumps(obj, indent=1))
+except Exception as e:
+    print('summary extraction failed:', e)
+PY
   kill "$stats_pid" 2>/dev/null || true
   echo "== main summary (exit $k6_exit):"
-  python3 - "$artifacts/load/main.summary.json" <<'PY'
+  python3 - "artifacts/load/main.summary.json" <<'PY'
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -58,7 +70,7 @@ try:
     print(f"planned≈33030 (ramp 1→100×60s + 100×300s); sent http_reqs={http}; completed iterations={iters}; dropped={dropped}")
     for name in ('motiva_goodput_rate', 'motiva_events_accepted', 'motiva_spends_posted', 'motiva_failed_requests', 'checks'):
         if name in m:
-            print(name, '=', m[name].get('rate', m[name].get('count')))
+            print(name, '=', m[name].get('count', m[name].get('rate')))
 except Exception as e:
     print('summary parse (see raw file):', e)
 PY
@@ -68,7 +80,7 @@ PY
 competitors() {
   echo "== k6 two-competitor scenario (aggregated Counter thresholds — the run FAILS on a broken invariant)"
   local args
-  args=$(envs)
+  args=$(K6_REQUIRE_RACE=1 bash scripts/k6env.sh)
   # shellcheck disable=SC2086
   docker compose run --rm $args k6 run /scripts/competitors.js 2>&1 | tee artifacts/load/competitors.log | tail -12
   python3 scripts/load_verify.py
@@ -76,7 +88,7 @@ competitors() {
 
 export100k() {
   echo "== export 100k rows within 120s with content verification (T07)"
-  python3 scripts/load_export100k.py
+  python3 scripts/load_export100k.py 2>&1 | tee artifacts/load/export100k.log
 }
 
 # degradation() runs the SAME profile (100 RPS, 50/25/10/10/5 via the shared mix.js) while
@@ -93,12 +105,22 @@ degradation() {
   local api_pid=$!
   sample_stats artifacts/load/stats-degradation.csv 380 &
   local stats_pid=$!
-  # Same summary/stderr split as the main profile; no hard thresholds in this pass (D15):
-  # it documents the degradation profile while the same mix keeps running.
+  # Same extraction as the main profile; no hard thresholds in this pass (D15): it documents
+  # the degradation profile while the same mix keeps running.
   # shellcheck disable=SC2086
   docker compose run --rm $args k6 run --summary-export /dev/stdout /scripts/degradation.js \
-    > artifacts/load/degradation.summary.json 2> >(tee artifacts/load/degradation.log >&2)
+    > >(tee artifacts/load/degradation.log) 2>&1
   local k6_exit=$?
+  python3 - <<'PY'
+import json, pathlib
+raw = pathlib.Path('artifacts/load/degradation.log').read_text()
+start = raw.rfind('\n{')
+try:
+    obj, _ = json.JSONDecoder().raw_decode(raw[start + 1:])
+    pathlib.Path('artifacts/load/degradation.summary.json').write_text(json.dumps(obj, indent=1))
+except Exception as e:
+    print('degradation summary extraction failed:', e)
+PY
   kill "$stats_pid" 2>/dev/null || true
   wait "$valkey_pid" "$s3_pid" "$api_pid" 2>/dev/null || true
   echo "degradation pass complete (exit $k6_exit; see artifacts/load/degradation.{summary.json,log} + stats-degradation.csv)"

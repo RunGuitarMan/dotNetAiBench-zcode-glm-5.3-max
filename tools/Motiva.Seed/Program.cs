@@ -275,9 +275,13 @@ var raceTask = await content.CreateTaskAsync(
     admin, Id(raceStream.Body), "TR", "Race task", null, 3, Motiva.Domain.Periods.PeriodKind.Day, 0,
     new[] { new Motiva.Application.Dto.RewardItemDto(resourceIds[0], 10L) }, null, "seed-race-t", CancellationToken.None);
 Ok(raceTask.Status, "race task create");
+var raceCurrent = await campaignsService.GetAsync(admin, raceCampaignId, CancellationToken.None);
+var racePublish = await campaignsService.PatchAsync(
+    admin, raceCampaignId, ETags.Format(raceCurrent.Version), null, null, null, CampaignStatus.Published, CancellationToken.None);
+Ok(racePublish.Status, "race campaign publish");
 var raceBudget = await Resolve<BudgetService>().AllocateAsync(admin, raceCampaignId, resourceIds[0], 10, null, "SEED-RACE-BUDGET-" + raceCode, CancellationToken.None);
 Ok(raceBudget.Status, "race budget allocate (exactly the reward — the last remainder)");
-var raceGrant = await Resolve<IntegrationGrantsService>().CreateAsync(admin, "progress-source", GrantKind.Progress, raceCampaignId, null, null, "seed-race-g", CancellationToken.None);
+var raceGrant = await Resolve<IntegrationGrantsService>().CreateAsync(admin, "progress-source", GrantKind.Progress, raceCampaignId, null, null, "seed-race-g-" + raceCode, CancellationToken.None);
 if (raceGrant.Status != 201 && !raceGrant.Body.Contains("already"))
 {
     Ok(raceGrant.Status, "race progress grant");

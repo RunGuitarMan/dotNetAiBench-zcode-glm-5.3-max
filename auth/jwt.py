@@ -76,6 +76,10 @@ def ensure_project() -> None:
         private_write(PROJECT.parent / 'Program.cs',
                       'var builder = WebApplication.CreateBuilder(args);\n'
                       'var app = builder.Build();\napp.Run();\n')
+        # `dotnet user-jwts` reads appsettings[.Development].json and fails without them —
+        # a fresh clone must generate them for the clean start to work (T01/T10).
+        private_write(PROJECT.parent / 'appsettings.json', '{\n  "Logging": {\n    "LogLevel": {\n      "Default": "Warning"\n    }\n  }\n}\n')
+        private_write(PROJECT.parent / 'appsettings.Development.json', '{\n}\n')
 
 
 def decode_segment(value: str) -> bytes:

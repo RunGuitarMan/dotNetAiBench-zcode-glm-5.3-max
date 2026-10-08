@@ -29,12 +29,13 @@ export const options = {
         { target: 100, duration: '60s' },   // same warmup shape as the main profile
         { target: 100, duration: '300s' },  // the outage windows fall inside this stage
       ],
-      exec: 'mix',
     },
   },
 };
 
+// One PRNG per VU (per-VU init scope), advanced across iterations — see main.js.
+const rng = makeRng(Number(__ENV.SEED || 42) + ((__VU || 1) - 1) * 7919 + 104729);
+
 export default function () {
-  const rng = makeRng(Number(__ENV.SEED || 42) + (__VU - 1) * 7919 + 104729);
   runMix(env, rng);
 }

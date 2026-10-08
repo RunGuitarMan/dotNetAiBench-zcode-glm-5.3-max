@@ -1,15 +1,134 @@
 # Stage 4 — реализация Motiva
 
+Статус: **R2** — второй раунд исправлений после внешней оценки R1/F (44,5/100, gate FAIL).
+R0 сохранён в commit `c9912e2`, R1 — в `f91d953`; оба раздела ниже сохранены как история.
+R2 закрывает остатки R1 (D01, D05–D09, D11, D13, D15, D16) и регрессию D18; найдены и
+исправлены три дополнительных реальных дефекта (даты с «Z», восстановление form-export,
+чистый старт jwt.py). Все команды ниже выполнены на финальном commit; артефакты — `artifacts/`.
+
+## 0. Коммит R2
+
+См. `git log -1`. База R2-кода — `2d21bb9` + данный документ.
+
+## 0.1 Изменения R2 по каждому пункту обратной связи (D01–D18)
+
+| Пункт | Статус R1 | Что изменено в R2 | Доказательство |
+|---|---|---|---|
+| D01 утечка detail заблокированным Admin | частично | Решение о видимости операции перенесено из Infrastructure в `ReadService.GetOperationAsync` (store — чистый `GetByIdAsync`); перед любым чтением — `CurrentRights.EnsureActiveEmployeeAsync` (активность из БД, не из JWT). Полный контроль видимости кампаний `CampaignsService.EnsureVisibleAsync` (detail + все content-чтения через него); активность в `CatalogService` (кампании, ресурсы, достижения) | Functional `d01_blocked_admin_cannot_read_foreign_operation_detail`, `d01_blocked_user_cannot_read_campaign_detail_or_catalog`; HTTP `blocked_admin_get_of_foreign_operation_is_403_over_http` (точная трасса проверки: награждение 5 → блокировка → GET 403, без masterId в теле) |
+| D05 список выдаёт скрытое задание | частично | `ListVisibleTasksAsync`: аудитория задания фильтруется во всех списках; курсорная пагинация без потерь (граница после последнего возвращённого, не последнего прочитанного) | Functional `d05_task_list_excludes_out_of_audience_tasks_and_pages_losslessly` (постраничный обход size=1: скрытое не выдано ни на одной странице, видимое достижимо) |
+| D06 архивный ресурс в новых настройках | частично | `ValidateRewardItemsAsync` требует статус Active у каждого ресурса награды — создание И изменение задания (purchase system и campaign set закрыты в R1) | Functional `d06_new_task_settings_reject_archived_resource` (ресурс в наборе draft-кампании → архив → create 400 и patch 400) |
+| D07 If-Match дочерних сущностей | частично | `LockCampaignRowAsync` (FOR UPDATE + tracker reset) во ВСЕХ дочерних мутациях: PatchStream, PatchTask, DeleteMilestone, DeleteChallenge — версия агрегата меняется атомарно | Functional `d07_…` (8 параллельных PATCH задания: 1×200 + 7×412, версия v2 свежим scope); HTTP `concurrent_task_patch_…` (8 параллельных: 1×200 + 7×412, ETag `"v2"`) |
+| D08 существенные данные campaign | частично | essential = {code, season, name, description, ownerMasterId, startsAt, endsAt, audience(канониз.)}; порядок §3.0: права → сохранённый replay → бизнес-предусловия (проверка владельца после echo) | Functional `d08_campaign_essentials_cover_description_and_window` (изменение description/startsAt → 409; идентичный replay → исходные 201/тело/Location), `d08_committed_campaign_replay_survives_a_later_owner_block` |
+| D09 Location при replay сотрудника | частично | `IdempotencyGate.LocationOf` понимает `id` (строка/число) и `masterId` (число) | Functional `d09_employee_creation_replay_keeps_location`; HTTP `employee_creation_replay_keeps_location_over_http` (201 + тот же Location `/api/v1/employees/4242`) |
+| D11 очистка при удалении+поздней загрузке+сбое | частично | (а) `HasLiveLeaseAsync` — lease жив независимо от статуса строки (Deleted с живым lease не даёт снять intent); (б) фенсинг каждой части: перед yield — строка не Deleted + продление lease (TimeProvider, не wall-clock); зомби-воркер прерывает multipart сам; (в) победившая попытка удаляет объекты проигравших (`DeleteOthersAsync`, включая незавершённые multipart); (г) form-export job при живом чужом lease НЕ завершается молча — RetryAt+15 c (раньше экспорт зависал в Forming навсегда после crash — найдено S-4 E2E) | Functional `d11_delete_during_upload_then_worker_failure_still_cleans_bytes` (точная трасса проверки: реальный upload → delete → sweep в lease → сбой после upload → sweep снимает объект без участия воркера), `d11_frozen_worker_aborts_upload_after_delete`, обновлённые c2/c3; E2E `S-3` (реальный pause/kill процессов: delete 204, воскрешения нет, intent снят) и `S-4` (kill воркера между upload и Ready → Ready, 115 632 строки == БД) |
+| D13 действенность тестов | частично | M5-защита в Functional+HTTP (user → чужой masterId: 403, кошелёк жертвы нетронут, сервисный грант — позитивный контроль); EDGE-02 переписан: два задания одного стрима, ДВА параллельных завершения через барьер, пороги 10/20 одного достижения, очки 25 = 10+15; `ScriptedImpediments`: сигнал достижения фазы (`WaitReachedAsync`), жёсткая пауза без авто-отпускания (защитный 120 c FAIL, не «успех»), one-shot пауза для одного воркера; C1/C2 без `Task.Delay`-синхронизации | Прогоны ниже; пробы m1–m6: 5/6 ловятся бизнес-assertions (балансы/исходы/история), m3 — БД-ограждением `ux_operations_single_reversal` (деньги защищены вторым слоем; тест падает на DbUpdateException, не молчит) |
+| D16 границы и метрики | частично | Авторизация операции полностью в Application; middleware получает `IRequestMetrics` (Application-интерфейс) — исключение `ProblemDetailsMiddleware` из архитектурного теста УДАЛЕНО; DB-метрики — реальные: `DbCommandTimingInterceptor` меряет каждую команду EF (`eventData.Duration`), рендер разделён (RequestLatencies/DbLatencies — разные выборки) | Architecture 5/5 без исключений; E2E «metrics on controlled traffic»: read-count вырос на контролируемых GET (одна реплика), `motiva_db_duration_ms{kind="SELECT"/"INSERT"} — реальные замеры (артефакт `artifacts/load/metrics-after-load.txt`) |
+| D18 синтаксис test.sh | регрессия R1 | Скобки `${…:-${…:-…}}` восстановлены; `bash -n` всех 9 скриптов; чистый checkout: restore → migrate (отдельная пустая БД, M1→M4) → `jwt.py prepare` → bootstrap → `test.sh unit/http` — exit 0. Найден и исправлен дефект чистого старта: `jwt.py ensure_project` не создавал appsettings*.json, без которых `dotnet user-jwts` падает | `bash -n` вывод; логи прогона в чистом клоне `/tmp/motiva-r2-clean` (exit 0) |
+| D15/T09 | частично | Основной профиль: общий `load/mix.js` (50/25/10/10/5), seeded PRNG (mulberry32, SEED=42, per-VU init — найден и исправлен дефект пересоздания PRNG на каждой итерации: VU застывал на одной ветке/одном кошельке); goodput = Rate «корректный бизнес-результат ≤1 c» с порогом ≥99,5 %; счётчики events/spends для сверки. Деградация — ТОт же профиль 100 RPS 60+300 c (Valkey 30 c / S3 30 c / API-2 10 c). Конкуренты: выделенная race-пара из seed (бюджет ровно 10 = награде, публикация), агрегация через k6 Counter-пороги (провал роняет команду), VU-массивы убраны. Верификатор `load_verify.py` сверяет k6-счётчики с БД в окне прогона | §3 ниже: exit codes, planned/sent/completed, goodput, p95, гонка 1/1/0, сверка k6==БД |
+
+Дополнительные дефекты, найденные и исправленные в R2 (сплошная проверка «соседних путей»):
+
+1. **StrictDates сдвигал все «Z»-даты на офсет машины** (литерал `'Z'` в формате → время
+   читалось как локальное: на хосте UTC+3 `2026-01-01T00:00:00Z` превращалось в
+   `2025-12-31T21:00:00+00`). Исправлено спецификатором `K` + явная проверка наличия офсета
+   (`HTTP StrictDatesZuluTests`: парсер возвращает точный инстант; годовая кампания — один сезон).
+2. **Form-export job завершался молча при живом lease** (после crash воркера экспорт зависал в
+   Forming навсегда). `HandleAsync` возвращает признак завершённости; RetryAt+15 c (E2E S-4).
+3. **Чистый старт `auth/jwt.py prepare`** — см. D18.
+
+## 1. Команды и результаты (финальный commit)
+
+| Команда | Результат |
+|---|---|
+| `dotnet build Motiva.sln --no-restore` | 0 warnings, 0 errors |
+| `scripts/test.sh unit` | 40/40 |
+| `scripts/test.sh architecture` | 5/5 (+ двойной гейт `verify-arch-gate.sh` — RS0030 и NetArchTest срабатывают на подсаженных нарушениях) |
+| `scripts/test.sh persistence` | 7/7 (реальный PG) |
+| `scripts/test.sh functional` ×3 | 66/66 три раза подряд (`artifacts/r2/functional-x3.log`) |
+| concurrency-класс ×10 | 6/6 десять раз (`artifacts/r2/concurrency-x10.log`) |
+| `scripts/test.sh http` | 30/30 |
+| `scripts/e2e/run.sh` | 28 проверок, 0 отказов (`artifacts/e2e/run-final.log`) — вкл. replay через рестарт API, финализация ≤5 c, Valkey/S3/PG/API-отказы, экспорт bytes immutable, **S-4 kill воркера между upload и Ready (восстановление, 115 632 строки == БД)**, **S-3 реальный замороженный воркер против delete (фенсинг, без воскрешения, intent снят)**, метрики на контролируемых запросах |
+| `dotnet format Motiva.sln --verify-no-changes` | exit 0 |
+| Чистый checkout (`/tmp/motiva-r2-clean`, без bin/obj) | restore → migrate (пустая БД `motiva_r2_clean`, M1→M4) → `python3 auth/jwt.py prepare` → `bootstrap.sh` (exit 0) → `test.sh unit`/`http` (exit 0) |
+
+Смысловые пробы (по одной в изолированной ветке, `artifacts/r2/probes/`):
+
+| Проба | Мутация | Исходный сценарий | Результат |
+|---|---|---|---|
+| m1 | отказ при равенстве бюджета (`<` → `<=`) | проходит | ПАДАЕТ на исходе награды (обнаружена) |
+| m2 | сохранённый Declined повторно исполняется (оба replay-шва только Posted) | проходит | ПАДАЕТ на балансе (обнаружена) |
+| m3 | снята защита повторного возврата в сервисе | проходит | ПАДАЕТ на БД-огражчении `ux_operations_single_reversal` — деньги защищены вторым слоем; двойной эффект невозможен, тест не зелёный |
+| m4 | рейтинг считает переданный delta вместо зачтённого | проходит | ПАДАЕТ на счёте (обнаружена) |
+| m5 | user списывает чужой masterId | проходит | ПАДАЕТ: AuthzForbidden-тест видит Posted и изменение чужого баланса (обнаружена) |
+| m6 | компилируемый endpoint с зависимостью от Infrastructure (не banned-тип) | — | ПАДАЕТ архитектурный тест (обнаружена) |
+
+После каждой пробы исходник восстановлен побайтно (branch deleted, `git checkout base -- src/ tests/…`), сборка восстановлена.
+
+## 2. T09 (D15) — обязательный профиль
+
+Стенд: macOS arm64 12 CPU/18 GB; compose: 2×API + 2×worker + LB + PG 17.9 + Valkey 9.2 + MinIO;
+генератор k6 2.3.0 в контейнере той же сети (ограничение генератора не объявляется пределом
+приложения). Подготовка seed=42 вне измерения: 10 000+100 сотрудников, 3 ресурса, 10 кампаний ×
+10 заданий, 100 000 событий (завершения 9,0 %), 100 000 движений, все кошельки пополнены,
+уникальные номера операций; race-пара: goal 3 / награда 10 / бюджет ровно 10 (опубликована).
+
+**Основной профиль** (ramping-arrival-rate 1→100/с за 60 c + 100/с 300 c; смесь 50/25/10/10/5;
+`artifacts/load/main.{log,summary.json,report.json}`, `stats-main.csv`):
+
+- planned ≈ 33 030 итераций; **отправлено 33 029 HTTP-запросов; завершено 33 029 итераций; dropped 0**;
+- **goodput 99,994 %** (33 299/33 301 запросов дали корректный бизнес-результат в пределах 1 c;
+  Rate-метрика на запрос, не на check; порог ≥99,5 % пройден, k6 exit 0);
+- p95 чтение **4,70 мс** (цель ≤200), p95 запись **10,42 мс** (цель ≤500), max 30,64 мс →
+  p99 < 1 с (цель ≤1000) — по построению p99 ≤ max;
+- бизнес-проверки: события `result=Accepted`, траты `result=Posted` (Declined считается провалом);
+- ресурсов: ряды `docker stats` каждые 10 c за весь прогон (`stats-main.csv`: api/worker/postgres/k6/valkey/s3);
+  реальные задержки БД за прогон — `metrics-after-load.txt`: SELECT p95 0,68 мс, INSERT p95 0,28 мс
+  (измерены перехватчиком команд, не HTTP-замерами).
+
+**Сверка ожидаемых и сохранённых эффектов** (`scripts/load_verify.py`, окно прогона):
+
+- события: k6 accepted **3345** == сохранено **3345**; траты: k6 Posted **1706** == сохранено **1706**;
+- дублей LOAD-номеров 0, дублей номеров событий 0, отрицательных бюджетов 0, отрицательных балансов 0.
+
+**Сценарий двух конкурентов за последний остаток** (бюджет ровно 10, награда 10):
+k6 exit 0 — агрегированные Counter-пороги `granted==1`, `declined==1`, `bad==0` пройдены;
+SQL: Posted 1 / Declined 1 / остаток 0 (не −10).
+
+**Деградационный проход** — тот же профиль 100 RPS 60+300 c, та же смесь из общего `mix.js`;
+Valkey pause 30 c (внутри измерения), S3 stop 30 c, один API stop 10 c
+(`degradation.{log,summary.json}`, `stats-degradation.csv`): 33 002 запросов, dropped 28,
+goodput 99,65 % (32886/33002 корректных в ≤1 c — отказы только в окнах отключений),
+восстановление без ручного вмешательства. PostgreSQL отключается отдельно в E2E:
+readiness 503 + Retry-After, liveness 200, запись 503, после восстановления replay идентичен
+(и это не выдаётся за бизнес-доступность).
+
+**Экспорт 100k+** (`export100k.log`): Ready за 30,2 с (цель ≤120), 15,06 МБ, 120 867 строк ==
+числу проведённых движений в диапазоне, checksum совпал при скачивании.
+
+## 3. Остаточные ограничения (честно)
+
+1. 250/500/1000 RPS (опциональная часть T09) — не проверено.
+2. Проба m3 обнаруживается БД-ограждением, а не сервисным assertion баланса (деньги защищены;
+   тест красный — двойной эффект невозможен, но диагностика через 500/DbUpdateException).
+3. Деградационный goodput 99,65 % ниже основного (99,994 %) — это ожидаемо для окон отказов
+   и не является гейтом; гейты — в основном профиле.
+4. Сгенерированный p99 в summary-export отсутствует (порог p99 проверялся k6-порогом;
+   из max=30,64 мс следует p99 ≤ 30,64 мс < 1000 мс).
+
+---
+
+# R1 (F) — первый раунд исправлений (история; commit f91d953)
+
 Статус: **F** — первый раунд исправлений R1 после внешней оценки R0 (26/100, gate FAIL).
 R0 сохранён в истории Git (commit c9912e2) и в §7 ниже. Все пункты обратной связи H1
-восемь групп дефектов D01–D17) закрыты в этом раунде; команды, exit codes и исходные
+(восемь групп дефектов D01–D17) закрыты в этом раунде; команды, exit codes и исходные
 отчёты обновлены. Секреты и токены в Git не попадали.
 
-## 0. Коммит F
+## R1.0 Коммит F
 
-См. `git log -1` — фиксация вместе с этим документом. R0-коммит `c9912e2` не переописан.
+`f91d9539d5c7c7e628ce393a53130be2bb540cb1` (R0-коммит `c9912e2` не переописан).
 
-## 0.1 Изменения по пунктам H1 (D01–D17)
+## R1.1 Изменения по пунктам H1 (D01–D17)
 
 | Пункт H1 / дефект | Что изменено | Проверки |
 |---|---|---|
