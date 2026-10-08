@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 
-namespace Motiva.Api.Infrastructure;
+namespace Motiva.Infrastructure;
 
 /// <summary>Lightweight metric registry (T06): request latency by kind, error counts, economic
 /// operation outcomes, outbox queue depth; exposed in Prometheus text format at /metrics.</summary>
@@ -23,6 +23,14 @@ public static class MotivaMetrics
     public static void ObserveRequest(string kind, double milliseconds)
     {
         RequestDuration.Record(milliseconds, new KeyValuePair<string, object?>("kind", kind));
+        lock (LatencyLock)
+        {
+            RequestLatencies.Add((kind, milliseconds));
+            if (RequestLatencies.Count > 20_000)
+            {
+                RequestLatencies.RemoveRange(0, RequestLatencies.Count - 10_000);
+            }
+        }
     }
 
     public static void ObserveDb(double milliseconds, string operation)
@@ -45,7 +53,7 @@ public static class MotivaMetrics
         return Counters.TryGetValue(name, out var value) ? value : 0;
     }
 
-    /// <summary>Prometheus text exposition of counters and histograms registered so far.</summary>
+    /// <summary>Prometheus text exposition: counters plus latency and bucket summaries.</summary>
     public static string RenderText()
     {
         var builder = new System.Text.StringBuilder();
@@ -55,6 +63,40 @@ public static class MotivaMetrics
             builder.Append("motiva_").Append(pair.Key.Replace(':', '_')).Append(' ').Append(pair.Value).Append('\n');
         }
 
+        RenderHistogram(RequestDuration, "motiva_request_duration_ms", builder);
+        RenderHistogram(DbOperationDuration, "motiva_db_duration_ms", builder);
         return builder.ToString();
+    }
+
+    private static readonly object LatencyLock = new();
+    private static readonly List<(string Kind, double Milliseconds)> RequestLatencies = [];
+
+    private static void RenderHistogram(Histogram<double> histogram, string name, System.Text.StringBuilder builder)
+    {
+        List<(string Kind, double Milliseconds)> snapshot;
+        lock (LatencyLock)
+        {
+            snapshot = [.. RequestLatencies];
+        }
+
+        var grouped = snapshot.GroupBy(x => x.Kind).OrderBy(g => g.Key, StringComparer.Ordinal);
+        builder.Append("# TYPE ").Append(name).Append(" summary\n");
+        foreach (var group in grouped)
+        {
+            var sorted = group.Select(x => x.Milliseconds).OrderBy(v => v).ToList();
+            if (sorted.Count == 0)
+            {
+                continue;
+            }
+
+            double Quantile(double q) => sorted[(int)Math.Min(sorted.Count - 1, Math.Round(q * (sorted.Count - 1)))];
+            builder.Append(name).Append("{kind=\"").Append(group.Key).Append("\",quantile=\"0.5\"} ")
+                .Append(Quantile(0.5).ToString("F2", System.Globalization.CultureInfo.InvariantCulture)).Append('\n');
+            builder.Append(name).Append("{kind=\"").Append(group.Key).Append("\",quantile=\"0.95\"} ")
+                .Append(Quantile(0.95).ToString("F2", System.Globalization.CultureInfo.InvariantCulture)).Append('\n');
+            builder.Append(name).Append("{kind=\"").Append(group.Key).Append("\",quantile=\"0.99\"} ")
+                .Append(Quantile(0.99).ToString("F2", System.Globalization.CultureInfo.InvariantCulture)).Append('\n');
+            builder.Append(name).Append("_count{kind=\"").Append(group.Key).Append("\"} ").Append(sorted.Count).Append('\n');
+        }
     }
 }

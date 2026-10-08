@@ -76,6 +76,11 @@ public sealed class EmployeeStore(MotivaDbContext db) : IEmployeeDirectory
     public async Task<UpdateOutcome> PatchAsync(
         Guid companyId, int masterId, int expectedVersion, bool? isActive, IReadOnlyList<string>? tags, CancellationToken ct)
     {
+        // Serialize concurrent patches of the same row: the version check must be atomic
+        // against other If-Match writers (T04, T06).
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"SELECT master_id FROM employees WHERE company_id = {companyId} AND master_id = {masterId} FOR UPDATE", ct);
+        db.ChangeTracker.Clear();
         var row = await db.Employees.Include(e => e.Tags)
             .FirstOrDefaultAsync(e => e.CompanyId == companyId && e.MasterId == masterId, ct);
         if (row is null)
@@ -163,6 +168,9 @@ public sealed class ResourceStore(MotivaDbContext db) : IResourceDirectory
     public async Task<(UpdateOutcome, ResourceRec?)> PatchAsync(
         Guid companyId, Guid id, int expectedVersion, string? name, ResourceStatus? status, CancellationToken ct)
     {
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"SELECT id FROM resources WHERE id = {id} FOR UPDATE", ct);
+        db.ChangeTracker.Clear();
         var row = await db.Resources.FindAsync(new object[] { id }, ct);
         if (row is null || row.CompanyId != companyId)
         {
@@ -241,6 +249,9 @@ public sealed class AchievementStore(MotivaDbContext db) : IAchievementDirectory
     public async Task<(UpdateOutcome, AchievementRec?)> PatchAsync(
         Guid companyId, Guid id, int expectedVersion, string? name, string? description, CancellationToken ct)
     {
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"SELECT id FROM achievements WHERE id = {id} FOR UPDATE", ct);
+        db.ChangeTracker.Clear();
         var row = await db.Achievements.FindAsync(new object[] { id }, ct);
         if (row is null || row.CompanyId != companyId)
         {
@@ -312,6 +323,9 @@ public sealed class PurchaseSystemStore(MotivaDbContext db) : IPurchaseSystemDir
     public async Task<(UpdateOutcome, PurchaseSystemRec?)> PatchAsync(
         Guid companyId, Guid id, int expectedVersion, string? name, ContentStatus? status, IReadOnlyList<Guid>? acceptedResourceIds, CancellationToken ct)
     {
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"SELECT id FROM purchase_systems WHERE id = {id} FOR UPDATE", ct);
+        db.ChangeTracker.Clear();
         var row = await db.PurchaseSystems.Include(p => p.AcceptedResources)
             .FirstOrDefaultAsync(p => p.CompanyId == companyId && p.Id == id, ct);
         if (row is null)
@@ -414,6 +428,9 @@ public sealed class IntegrationGrantStore(MotivaDbContext db) : IIntegrationDire
 
     public async Task<UpdateOutcome> RevokeAsync(Guid companyId, Guid id, int expectedVersion, DateTimeOffset utcNow, CancellationToken ct)
     {
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"SELECT id FROM integration_grants WHERE id = {id} FOR UPDATE", ct);
+        db.ChangeTracker.Clear();
         var row = await db.IntegrationGrants.FindAsync(new object[] { id }, ct);
         if (row is null || row.CompanyId != companyId)
         {

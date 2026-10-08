@@ -9,6 +9,8 @@ namespace Motiva.Application.Campaigns;
 /// composition is immutable after publication; economic task fields too (§4.5 matrix).
 /// Every child mutation raises the campaign aggregate version (ETag, §4.4).</summary>
 public sealed class CampaignContentService(
+    CurrentRights rights,
+    CampaignsService campaignsService,
     ICampaignCatalog campaigns,
     IAchievementDirectory achievements,
     IAuditLog audit,
@@ -16,15 +18,23 @@ public sealed class CampaignContentService(
     IdempotencyGate gate,
     TimeProvider timeProvider)
 {
+    private static readonly Dictionary<string, string> LocationPrefixes = new()
+    {
+        ["stream.create"] = "/api/v1/streams/",
+        ["task.create"] = "/api/v1/tasks/",
+        ["milestone.create"] = "/api/v1/milestones/",
+        ["challenge.create"] = "/api/v1/challenges/",
+    };
+
     public async Task<CommandResponse> CreateStreamAsync(
         ActorContext actor, Guid campaignId, string? rawCode, string name, string? idempotencyKey, CancellationToken ct)
     {
         var campaign = await GetCampaignAsync(actor, campaignId, ct);
-        CampaignsService.EnsureCanConfigure(actor, campaign);
-        EnsureDraft(campaign);
+        await campaignsService.EnsureCanConfigureAsync(actor, campaign, ct);
         var code = Guard.Code(rawCode);
         Guard.Name(name);
-        return await CreateChildAsync(actor, campaign, "stream.create", code, idempotencyKey,
+        var essential = CanonicalJson.Serialize(new { code, name, campaignId = campaign.Id });
+        return await CreateChildAsync(actor, campaign, "stream.create", essential, idempotencyKey,
             async () =>
             {
                 var id = Guid.NewGuid();
@@ -43,10 +53,15 @@ public sealed class CampaignContentService(
         }
         var stream = await campaigns.GetStreamAsync(actor.CompanyId, streamId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
         var campaign = await GetCampaignAsync(actor, stream.CampaignId, ct);
-        CampaignsService.EnsureCanConfigure(actor, campaign);
+        await campaignsService.EnsureCanConfigureAsync(actor, campaign, ct);
+        if (stream.Status == ContentStatus.Archived)
+        {
+            // Archiving is irreversible: an archived stream allows no changes (B09.1 analog, §4.5).
+            throw new MotivaException(ErrorCode.ConflictState, "Archived content cannot be changed.");
+        }
+
         if (status == ContentStatus.Archived && campaign.Status == CampaignStatus.Draft)
         {
-            // Archiving content of a not yet published campaign is meaningless; keep the transition to Published state.
             throw new MotivaException(ErrorCode.ConflictState, "Only content of a published campaign can be archived.");
         }
 
@@ -78,8 +93,7 @@ public sealed class CampaignContentService(
     {
         var stream = await campaigns.GetStreamAsync(actor.CompanyId, streamId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
         var campaign = await GetCampaignAsync(actor, stream.CampaignId, ct);
-        CampaignsService.EnsureCanConfigure(actor, campaign);
-        EnsureDraft(campaign);
+        await campaignsService.EnsureCanConfigureAsync(actor, campaign, ct);
         var code = Guard.Code(rawCode);
         Guard.Name(name);
         Guard.Description(description);
@@ -94,19 +108,37 @@ public sealed class CampaignContentService(
         }
 
         var items = await ValidateRewardItemsAsync(actor, campaign, rewardItems, ct);
-        var audienceRule = CampaignsService.NormalizeAudience(audience);
-        var essential = CanonicalJson.Serialize(new { code, streamId, goal, period = period.ToString(), streamPoints, items });
+        var audienceRule = CampaignsService.NormalizeAudience(audience) ?? Domain.Audiences.AudienceRule.Unrestricted;
+        // All essential fields of the create: a changed name/description/audience/rewards with
+        // the same key is a conflict, not a replay (T05).
+        var essential = CanonicalJson.Serialize(new
+        {
+            code,
+            name,
+            description,
+            streamId,
+            goal,
+            period = period.ToString(),
+            streamPoints,
+            items,
+            audience = audienceRule != null ? new { any = audienceRule.Any.OrderBy(t => t), all = audienceRule.All.OrderBy(t => t), none = audienceRule.None.OrderBy(t => t) } : null,
+        });
         var now = timeProvider.GetUtcNow();
         await using var scope = await uow.BeginAsync(ct);
         var echo = await gate.BeginOrEchoAsync(actor.CompanyId, actor, "task.create", streamId.ToString(), idempotencyKey, essential, ct);
         if (echo is not null)
         {
-            return new CommandResponse(echo.Status, echo.Body);
+            return new CommandResponse(echo.Status, echo.Body, echo.Location is not null ? LocationPrefixes["task.create"] + echo.Location : null);
+        }
+
+        if (campaign.Status != CampaignStatus.Draft)
+        {
+            throw new MotivaException(ErrorCode.ConflictState, "Content composition is immutable after publication.");
         }
 
         var id = Guid.NewGuid();
         var (outcome, value) = await campaigns.CreateTaskAsync(
-            actor.CompanyId, id, streamId, code, name, description, goal, period, streamPoints, items, audienceRule, ct);
+            actor.CompanyId, id, streamId, code, name, description, goal, period, streamPoints, items, audienceRule!, ct);
         if (outcome != UpdateOutcome.Ok)
         {
             throw new MotivaException(ErrorCode.ConflictState, "Task code already exists in the stream.");
@@ -138,7 +170,7 @@ public sealed class CampaignContentService(
         var task = await campaigns.GetTaskAsync(actor.CompanyId, taskId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
         var stream = await campaigns.GetStreamAsync(actor.CompanyId, task.StreamId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
         var campaign = await GetCampaignAsync(actor, stream.CampaignId, ct);
-        CampaignsService.EnsureCanConfigure(actor, campaign);
+        await campaignsService.EnsureCanConfigureAsync(actor, campaign, ct);
         var economicChange = goal is not null || period is not null || streamPoints is not null || rewardItems is not null;
         if (campaign.Status != CampaignStatus.Draft && economicChange)
         {
@@ -180,8 +212,7 @@ public sealed class CampaignContentService(
     {
         var stream = await campaigns.GetStreamAsync(actor.CompanyId, streamId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
         var campaign = await GetCampaignAsync(actor, stream.CampaignId, ct);
-        CampaignsService.EnsureCanConfigure(actor, campaign);
-        EnsureDraft(campaign);
+        await campaignsService.EnsureCanConfigureAsync(actor, campaign, ct);
         if (threshold is < 1 or > Guard.MaxUnit)
         {
             throw new MotivaException(ErrorCode.ValidationFailed, "threshold must be between 1 and 1000000000.");
@@ -196,7 +227,12 @@ public sealed class CampaignContentService(
         var echo = await gate.BeginOrEchoAsync(actor.CompanyId, actor, "milestone.create", streamId.ToString(), idempotencyKey, essential, ct);
         if (echo is not null)
         {
-            return new CommandResponse(echo.Status, echo.Body);
+            return new CommandResponse(echo.Status, echo.Body, echo.Location is not null ? LocationPrefixes["milestone.create"] + echo.Location : null);
+        }
+
+        if (campaign.Status != CampaignStatus.Draft)
+        {
+            throw new MotivaException(ErrorCode.ConflictState, "Content composition is immutable after publication.");
         }
 
         var id = Guid.NewGuid();
@@ -225,7 +261,7 @@ public sealed class CampaignContentService(
         var stream = await campaigns.GetStreamAsync(actor.CompanyId, milestone.StreamId, ct)
             ?? throw new MotivaException(ErrorCode.NotFound);
         var campaign = await GetCampaignAsync(actor, stream.CampaignId, ct);
-        CampaignsService.EnsureCanConfigure(actor, campaign);
+        await campaignsService.EnsureCanConfigureAsync(actor, campaign, ct);
         EnsureDraft(campaign);
         var now = timeProvider.GetUtcNow();
         await using var scope = await uow.BeginAsync(ct);
@@ -241,14 +277,8 @@ public sealed class CampaignContentService(
         ActorContext actor, Guid campaignId, Guid streamId, DateTimeOffset startsAt, DateTimeOffset endsAt, string? idempotencyKey, CancellationToken ct)
     {
         var campaign = await GetCampaignAsync(actor, campaignId, ct);
-        CampaignsService.EnsureCanConfigure(actor, campaign);
-        EnsureDraft(campaign);
+        await campaignsService.EnsureCanConfigureAsync(actor, campaign, ct);
         Guard.Range(startsAt, endsAt);
-        if (startsAt < campaign.StartsAt || endsAt > campaign.EndsAt)
-        {
-            throw new MotivaException(ErrorCode.ValidationFailed, "The challenge interval must be inside the campaign window.");
-        }
-
         var stream = await campaigns.GetStreamAsync(actor.CompanyId, streamId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
         if (stream.CampaignId != campaignId)
         {
@@ -261,7 +291,17 @@ public sealed class CampaignContentService(
         var echo = await gate.BeginOrEchoAsync(actor.CompanyId, actor, "challenge.create", campaignId.ToString(), idempotencyKey, essential, ct);
         if (echo is not null)
         {
-            return new CommandResponse(echo.Status, echo.Body);
+            return new CommandResponse(echo.Status, echo.Body, echo.Location is not null ? LocationPrefixes["challenge.create"] + echo.Location : null);
+        }
+
+        if (campaign.Status != CampaignStatus.Draft)
+        {
+            throw new MotivaException(ErrorCode.ConflictState, "Content composition is immutable after publication.");
+        }
+
+        if (startsAt < campaign.StartsAt || endsAt > campaign.EndsAt)
+        {
+            throw new MotivaException(ErrorCode.ValidationFailed, "The challenge interval must be inside the campaign window.");
         }
 
         var id = Guid.NewGuid();
@@ -286,7 +326,7 @@ public sealed class CampaignContentService(
         var challenge = await campaigns.GetChallengeAsync(actor.CompanyId, challengeId, ct)
             ?? throw new MotivaException(ErrorCode.NotFound);
         var campaign = await GetCampaignAsync(actor, challenge.CampaignId, ct);
-        CampaignsService.EnsureCanConfigure(actor, campaign);
+        await campaignsService.EnsureCanConfigureAsync(actor, campaign, ct);
         EnsureDraft(campaign);
         var now = timeProvider.GetUtcNow();
         await using var scope = await uow.BeginAsync(ct);
@@ -316,7 +356,28 @@ public sealed class CampaignContentService(
         var task = await campaigns.GetTaskAsync(actor.CompanyId, taskId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
         var stream = await campaigns.GetStreamAsync(actor.CompanyId, task.StreamId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
         await EnsureContentVisibleAsync(actor, stream.CampaignId, ct);
+        await EnsureTaskAudienceAsync(actor, task, ct);
         return task;
+    }
+
+    private async Task EnsureTaskAudienceAsync(ActorContext actor, TaskRec task, CancellationToken ct)
+    {
+        if (actor.IsAdmin)
+        {
+            return;
+        }
+
+        var campaign = await campaigns.GetAsync(actor.CompanyId, (await campaigns.GetStreamAsync(actor.CompanyId, task.StreamId, ct) ?? throw new MotivaException(ErrorCode.NotFound)).CampaignId, ct);
+        if (campaign is not null && campaign.OwnerMasterId == actor.MasterId)
+        {
+            return;
+        }
+
+        var employee = await rights.EnsureActiveEmployeeAsync(actor, ct);
+        if (!task.Audience.Matches(new HashSet<string>(employee.Tags)))
+        {
+            throw new MotivaException(ErrorCode.AuthzForbidden, "The task is outside your audience.");
+        }
     }
 
     public async Task<Page<TaskRec>> ListTasksAsync(ActorContext actor, Guid streamId, int limit, string? cursor, CancellationToken ct)
@@ -354,7 +415,8 @@ public sealed class CampaignContentService(
         return await campaigns.ListChallengesAsync(actor.CompanyId, campaignId, limit, cursor, ct);
     }
 
-    /// <summary>Content of a published campaign is visible to its audience; drafts only to owner/admin (B09.2, B11).</summary>
+    /// <summary>Content of a published campaign is visible to its current audience only — list
+    /// and detail alike; drafts are owner/admin only; every reader must be active (B09.2, B11, B05).</summary>
     private async Task EnsureContentVisibleAsync(ActorContext actor, Guid campaignIdOrStreamId, CancellationToken ct, bool byStream = false)
     {
         Guid campaignId;
@@ -375,6 +437,7 @@ public sealed class CampaignContentService(
             throw new MotivaException(ErrorCode.NotFound);
         }
 
+        var employee = await rights.EnsureActiveEmployeeAsync(actor, ct);
         if (actor.IsAdmin || campaign.OwnerMasterId == actor.MasterId)
         {
             return;
@@ -383,6 +446,11 @@ public sealed class CampaignContentService(
         if (campaign.Status == CampaignStatus.Draft)
         {
             throw new MotivaException(ErrorCode.NotFound);
+        }
+
+        if (!campaign.Audience.Matches(new HashSet<string>(employee.Tags)))
+        {
+            throw new MotivaException(ErrorCode.AuthzForbidden, "The content is outside your audience.");
         }
     }
 
@@ -437,18 +505,25 @@ public sealed class CampaignContentService(
         ActorContext actor,
         CampaignRec campaign,
         string operation,
-        string code,
+        string essential,
         string? idempotencyKey,
         Func<Task<(UpdateOutcome Outcome, object? Dto, object? Rec, string Location, int Version)>> create,
         CancellationToken ct)
     {
-        var essential = CanonicalJson.Serialize(new { code, campaignId = campaign.Id });
+        // §3.0 order: authorization happened in the caller; the saved idempotent result comes
+        // BEFORE parent-state preconditions — a replay of a committed create is returned even
+        // if the campaign has meanwhile been published or archived (T05).
         var now = timeProvider.GetUtcNow();
         await using var scope = await uow.BeginAsync(ct);
         var echo = await gate.BeginOrEchoAsync(actor.CompanyId, actor, operation, campaign.Id.ToString(), idempotencyKey, essential, ct);
         if (echo is not null)
         {
-            return new CommandResponse(echo.Status, echo.Body);
+            return new CommandResponse(echo.Status, echo.Body, echo.Location is not null ? LocationPrefixes[operation] + echo.Location : null);
+        }
+
+        if (campaign.Status != CampaignStatus.Draft)
+        {
+            throw new MotivaException(ErrorCode.ConflictState, "Content composition is immutable after publication.");
         }
 
         var (outcome, dto, _, location, _) = await create();

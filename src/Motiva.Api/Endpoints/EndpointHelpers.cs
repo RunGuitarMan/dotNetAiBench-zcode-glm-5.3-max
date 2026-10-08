@@ -58,6 +58,17 @@ internal static class EndpointHelpers
         return new RawJsonResult(200, body, new Dictionary<string, string>());
     }
 
+    /// <summary>Parses a wire enum safely: unknown values are contract 400s, never 500 (T04).</summary>
+    public static T ParseEnum<T>(string? value, string field) where T : struct, Enum
+    {
+        if (value is null || !Enum.TryParse<T>(value, out var parsed))
+        {
+            throw new MotivaException(ErrorCode.ValidationFailed, field + " has an invalid value.");
+        }
+
+        return parsed;
+    }
+
     private sealed record PageDto(IReadOnlyList<object> Items, string? NextCursor);
 }
 

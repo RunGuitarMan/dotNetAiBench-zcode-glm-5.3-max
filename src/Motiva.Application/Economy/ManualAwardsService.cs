@@ -11,6 +11,7 @@ namespace Motiva.Application.Economy;
 /// saved results returned by the same 201 schema (T04); the lock path is budgets → wallet
 /// balances (§3.1).</summary>
 public sealed class ManualAwardsService(
+    ITestImpediments impediments,
     IEmployeeDirectory employees,
     ICampaignCatalog campaigns,
     IResourceDirectory resources,
@@ -34,28 +35,27 @@ public sealed class ManualAwardsService(
 
         var essential = CanonicalJson.Serialize(new { campaignId, masterId, resourceId, amount, reason });
 
-        // §3.0 step 2: current rights and initiator activity first, before the number.
+        // §3.0 step 2: current rights and initiator activity first, before the number — for new
+        // requests AND replays: a former owner gets 403, not the stored body (B05.1).
+        var campaign = await campaigns.GetAsync(actor.CompanyId, campaignId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
         if (actor.ActorType == ActorType.Service)
         {
             Authz.EnsureGrant(await grants.FindActiveAsync(actor.CompanyId, actor.Subject, GrantKind.Award, campaignId, resourceId, null, ct));
         }
         else
         {
-            Authz.EnsureUser(actor);
-            var initiator = await employees.GetAsync(actor.CompanyId, masterId: actor.MasterId!.Value, ct: ct);
+            var initiator = await employees.GetAsync(actor.CompanyId, actor.MasterId!.Value, ct);
             Authz.EnsureActiveUser(actor, initiator);
+            if (!actor.IsAdmin && campaign.OwnerMasterId != actor.MasterId)
+            {
+                throw new MotivaException(ErrorCode.AuthzForbidden, "Only the current campaign owner or an administrator may award manually.");
+            }
         }
 
         var existing = await operations.FindByNumberAsync(actor.CompanyId, actor.InitiatorKey, OperationKind.ManualAward, operationNumber, ct);
         if (existing is not null)
         {
             return BudgetService.ReplayOrConflict(existing, essential);
-        }
-
-        var campaign = await campaigns.GetAsync(actor.CompanyId, campaignId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
-        if (actor.ActorType == ActorType.User && !actor.IsAdmin && campaign.OwnerMasterId != actor.MasterId)
-        {
-            throw new MotivaException(ErrorCode.AuthzForbidden, "Only the current campaign owner or an administrator may award manually.");
         }
 
         var now = timeProvider.GetUtcNow();
@@ -118,6 +118,7 @@ public sealed class ManualAwardsService(
         var body = CanonicalJson.Serialize(DtoMapper.ToDto(operation));
         operation = operation with { ResponseStatus = 201, ResponseBody = body };
         await operations.InsertAsync(operation, ct);
+        await impediments.CheckpointAsync(Checkpoints.ManualAwardBeforeCommit, ct);
         await scope.CommitAsync(ct);
         return new CommandResponse(201, body, "/api/v1/operations/" + operation.Id.ToString());
     }

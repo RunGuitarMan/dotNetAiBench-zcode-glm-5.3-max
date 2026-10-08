@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Motiva.Api.Infrastructure;
 using Motiva.Application.Common;
 using Motiva.Application.Competitions;
 using Motiva.Application.Dto;
@@ -19,12 +20,12 @@ internal static class ReadingEndpoints
         api.MapGet("/me/operations", async (
             [FromServices] ReadService reads, HttpContext http,
             [FromQuery] int? limit, [FromQuery] string? cursor,
-            [FromQuery] DateTimeOffset? from, [FromQuery] DateTimeOffset? to,
+            [FromQuery] string? from, [FromQuery] string? to,
             [FromQuery] Guid? resourceId, [FromQuery] string? kind, [FromQuery] string? result, CancellationToken ct) =>
         {
             var page = await reads.ListOwnOperationsAsync(
-                http.Actor(), Paging.NormalizeLimit(limit), cursor, from, to, resourceId,
-                kind is null ? null : Enum.Parse<OperationKind>(kind), result is null ? null : Enum.Parse<OperationResult>(result), ct);
+                http.Actor(), Paging.NormalizeLimit(limit), cursor, StrictDates.ParseOptionalUtc(from, "from"), StrictDates.ParseOptionalUtc(to, "to"), resourceId,
+                kind is null ? null : EndpointHelpers.ParseEnum<OperationKind>(kind, "kind"), result is null ? null : EndpointHelpers.ParseEnum<OperationResult>(result, "result"), ct);
             return EndpointHelpers.Page(page, DtoMapper.ToDto);
         });
 
@@ -39,10 +40,10 @@ internal static class ReadingEndpoints
         api.MapGet("/me/progress-events", async (
             [FromServices] ProgressEventsService progress, HttpContext http,
             [FromQuery] int? limit, [FromQuery] string? cursor,
-            [FromQuery] DateTimeOffset? from, [FromQuery] DateTimeOffset? to,
+            [FromQuery] string? from, [FromQuery] string? to,
             [FromQuery] Guid? campaignId, [FromQuery] Guid? taskId, CancellationToken ct) =>
         {
-            var page = await progress.ListOwnAsync(http.Actor(), Paging.NormalizeLimit(limit), cursor, from, to, campaignId, taskId, ct);
+            var page = await progress.ListOwnAsync(http.Actor(), Paging.NormalizeLimit(limit), cursor, StrictDates.ParseOptionalUtc(from, "from"), StrictDates.ParseOptionalUtc(to, "to"), campaignId, taskId, ct);
             return EndpointHelpers.Page(page, EconomyEndpoints.MapProgressEvent);
         });
 
@@ -57,12 +58,12 @@ internal static class ReadingEndpoints
         api.MapGet("/employees/{masterId:int}/operations", async (
             [FromServices] ReadService reads, HttpContext http, [FromRoute] int masterId,
             [FromQuery] int? limit, [FromQuery] string? cursor,
-            [FromQuery] DateTimeOffset? from, [FromQuery] DateTimeOffset? to,
+            [FromQuery] string? from, [FromQuery] string? to,
             [FromQuery] Guid? resourceId, [FromQuery] string? kind, CancellationToken ct) =>
         {
             var page = await reads.ListEmployeeOperationsAsync(
-                http.Actor(), masterId, Paging.NormalizeLimit(limit), cursor, from, to, resourceId,
-                kind is null ? null : Enum.Parse<OperationKind>(kind), ct);
+                http.Actor(), masterId, Paging.NormalizeLimit(limit), cursor, StrictDates.ParseOptionalUtc(from, "from"), StrictDates.ParseOptionalUtc(to, "to"), resourceId,
+                kind is null ? null : EndpointHelpers.ParseEnum<OperationKind>(kind, "kind"), ct);
             return EndpointHelpers.Page(page, DtoMapper.ToDto);
         });
 
@@ -73,10 +74,10 @@ internal static class ReadingEndpoints
         api.MapGet("/campaigns/{id:guid}/operations", async (
             [FromServices] ReadService reads, HttpContext http, [FromRoute] Guid id,
             [FromQuery] int? limit, [FromQuery] string? cursor,
-            [FromQuery] DateTimeOffset? from, [FromQuery] DateTimeOffset? to,
+            [FromQuery] string? from, [FromQuery] string? to,
             [FromQuery] Guid? resourceId, CancellationToken ct) =>
         {
-            var page = await reads.ListCampaignOperationsAsync(http.Actor(), id, Paging.NormalizeLimit(limit), cursor, from, to, resourceId, ct);
+            var page = await reads.ListCampaignOperationsAsync(http.Actor(), id, Paging.NormalizeLimit(limit), cursor, StrictDates.ParseOptionalUtc(from, "from"), StrictDates.ParseOptionalUtc(to, "to"), resourceId, ct);
             return EndpointHelpers.Page(page, DtoMapper.ToDto);
         });
 

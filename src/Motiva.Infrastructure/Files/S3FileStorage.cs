@@ -15,12 +15,14 @@ public sealed class S3FileStorage : IFileStorage, IDisposable
 {
     private readonly AmazonS3Client _client;
     private readonly string _bucket;
+    private readonly string _publicUrl;
     private readonly ILogger<S3FileStorage> _logger;
 
     public S3FileStorage(Microsoft.Extensions.Options.IOptions<MotivaInfrastructureOptions> optionsAccessor, ILogger<S3FileStorage> logger)
     {
         var options = optionsAccessor.Value;
         _bucket = options.S3Bucket;
+        _publicUrl = options.S3PublicUrl;
         _logger = logger;
         var config = new AmazonS3Config
         {
@@ -59,6 +61,56 @@ public sealed class S3FileStorage : IFileStorage, IDisposable
         }, ct);
     }
 
+    public async Task PutPartsAsync(string key, IAsyncEnumerable<byte[]> parts, CancellationToken ct)
+    {
+        // Streaming upload with bounded memory: multipart parts of a bounded size; the whole
+        // statement never materializes in RAM (T07).
+        await EnsureBucketAsync(ct);
+        var initiation = await _client.InitiateMultipartUploadAsync(new InitiateMultipartUploadRequest
+        {
+            BucketName = _bucket,
+            Key = key,
+            ContentType = "text/csv",
+        }, ct);
+        var etags = new List<PartETag>();
+        var partNumber = 1;
+        try
+        {
+            await foreach (var part in parts.WithCancellation(ct))
+            {
+                await using var partStream = new MemoryStream(part);
+                var response = await _client.UploadPartAsync(new UploadPartRequest
+                {
+                    BucketName = _bucket,
+                    Key = key,
+                    UploadId = initiation.UploadId,
+                    PartNumber = partNumber,
+                    InputStream = partStream,
+                }, ct);
+                etags.Add(new PartETag(partNumber, response.ETag));
+                partNumber++;
+            }
+
+            await _client.CompleteMultipartUploadAsync(new CompleteMultipartUploadRequest
+            {
+                BucketName = _bucket,
+                Key = key,
+                UploadId = initiation.UploadId,
+                PartETags = etags,
+            }, ct);
+        }
+        catch (Exception)
+        {
+            await _client.AbortMultipartUploadAsync(new AbortMultipartUploadRequest
+            {
+                BucketName = _bucket,
+                Key = key,
+                UploadId = initiation.UploadId,
+            }, CancellationToken.None);
+            throw;
+        }
+    }
+
     public async Task<DownloadLinkRec> CreateDownloadLinkAsync(string key, TimeSpan lifetime, CancellationToken ct)
     {
         var url = _client.GetPreSignedURL(new GetPreSignedUrlRequest
@@ -68,6 +120,14 @@ public sealed class S3FileStorage : IFileStorage, IDisposable
             Verb = HttpVerb.GET,
             Expires = DateTime.UtcNow.Add(lifetime > TimeSpan.FromSeconds(60) ? TimeSpan.FromSeconds(60) : lifetime),
         });
+        if (!string.IsNullOrEmpty(_publicUrl))
+        {
+            // The signature covers the path, not the host: the link stays valid through the
+            // public endpoint while the API itself talks to the internal one.
+            var builder = new UriBuilder(url) { Host = new Uri(_publicUrl).Host, Port = new Uri(_publicUrl).Port, Scheme = new Uri(_publicUrl).Scheme };
+            url = builder.ToString();
+        }
+
         return new DownloadLinkRec(Guid.NewGuid(), url, DateTimeOffset.UtcNow.Add(lifetime > TimeSpan.FromSeconds(60) ? TimeSpan.FromSeconds(60) : lifetime));
     }
 

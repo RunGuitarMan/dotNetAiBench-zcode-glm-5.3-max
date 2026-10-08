@@ -37,7 +37,9 @@ public static class TestTokens
         DateTime? expires = null,
         string? overrideMasterId = null,
         bool duplicateMasterId = false,
-        bool duplicateCompanyId = false)
+        bool duplicateCompanyId = false,
+        bool roles = true,
+        bool forceRoleForService = false)
     {
         var claims = new List<Claim>
         {
@@ -59,6 +61,11 @@ public static class TestTokens
             claims.Add(new Claim("companyId", Guid.NewGuid().ToString()));
         }
 
+        if (actorType == "service" && forceRoleForService)
+        {
+            claims.Add(new Claim("role", "Admin"));
+        }
+
         var credentials = new SigningCredentials(Key, SecurityAlgorithms.HmacSha256);
         var descriptor = new SecurityTokenDescriptor
         {
@@ -70,7 +77,7 @@ public static class TestTokens
             IssuedAt = DateTime.UtcNow,
             NotBefore = expires is null ? DateTime.UtcNow : expires.Value.AddHours(-2),
         };
-        if (actorType == "user")
+        if (actorType == "user" && roles)
         {
             descriptor.Subject.AddClaim(new Claim("role", "Employee"));
             if (admin)

@@ -20,10 +20,12 @@ public sealed class OperationsReadStore(
     {
         if (actor.ActorType == ActorType.Service)
         {
+            // Pure data filtering: an empty grant set yields an empty page; whether that is a
+            // 403 is a business decision of the application layer, not of the store.
             var pairs = await grants.ListActiveSpendPairsAsync(actor.CompanyId, actor.Subject, ct);
             if (pairs.Count == 0)
             {
-                throw new MotivaException(ErrorCode.AuthzGrantMissing);
+                return new Page<OperationRec>(Array.Empty<OperationRec>(), null);
             }
 
             return await operations.ListForSpendPairsAsync(actor.CompanyId, pairs, limit, cursor, from, toUtc, resourceId, kind, result, ct);
@@ -59,7 +61,7 @@ public sealed class OperationsReadStore(
             var pairs = await grants.ListActiveSpendPairsAsync(actor.CompanyId, actor.Subject, ct);
             if (pairs.Count == 0)
             {
-                throw new MotivaException(ErrorCode.AuthzGrantMissing);
+                return null; // the application layer decides whether a missing grant is a 403
             }
 
             var pairSet = pairs.Select(p => (p.PurchaseSystemId, p.ResourceId)).ToHashSet();

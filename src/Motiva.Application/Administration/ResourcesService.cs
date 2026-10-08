@@ -7,16 +7,19 @@ namespace Motiva.Application.Administration;
 /// <summary>Resources (B06–B07): the code is unique in the company ignoring case, immutable,
 /// never freed by archiving; archiving is irreversible; balances of a new resource are zero.</summary>
 public sealed class ResourcesService(
+    CurrentRights rights,
     IResourceDirectory resources,
     IAuditLog audit,
     IUnitOfWork uow,
     IdempotencyGate gate,
     TimeProvider timeProvider)
 {
+    private const string locationPrefix = "/api/v1/resources/";
+
     public async Task<CommandResponse> CreateAsync(
         ActorContext actor, string? rawCode, string name, string? idempotencyKey, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         var code = Guard.Code(rawCode);
         Guard.Name(name);
         var now = timeProvider.GetUtcNow();
@@ -25,7 +28,7 @@ public sealed class ResourcesService(
         var echo = await gate.BeginOrEchoAsync(actor.CompanyId, actor, "resource.create", "-", idempotencyKey, essential, ct);
         if (echo is not null)
         {
-            return new CommandResponse(echo.Status, echo.Body);
+            return new CommandResponse(echo.Status, echo.Body, echo.Location is not null ? locationPrefix + echo.Location : null);
         }
 
         if (await resources.GetByCodeAsync(actor.CompanyId, code, ct) is not null)
@@ -52,7 +55,7 @@ public sealed class ResourcesService(
     public async Task<CommandResponse> PatchAsync(
         ActorContext actor, Guid id, string? ifMatch, string? name, ResourceStatus? status, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         var version = ETags.ParseRequired(ifMatch);
         if (name is null && status is null)
         {
@@ -102,6 +105,9 @@ public sealed class ResourcesService(
     public async Task<ResourceRec> GetAsync(ActorContext actor, Guid id, CancellationToken ct)
         => await resources.GetAsync(actor.CompanyId, id, ct) ?? throw new MotivaException(ErrorCode.NotFound);
 
-    public Task<Page<ResourceRec>> ListAsync(ActorContext actor, ResourceStatus? status, int limit, string? cursor, CancellationToken ct)
-        => resources.ListAsync(actor.CompanyId, status, limit, cursor, ct);
+    public async Task<Page<ResourceRec>> ListAsync(ActorContext actor, ResourceStatus? status, int limit, string? cursor, CancellationToken ct)
+    {
+        await rights.EnsureActiveEmployeeAsync(actor, ct); // any company participant reads the catalog
+        return await resources.ListAsync(actor.CompanyId, status, limit, cursor, ct);
+    }
 }

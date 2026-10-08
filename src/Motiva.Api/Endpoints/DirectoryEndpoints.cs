@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Motiva.Api.Infrastructure;
 using Motiva.Application;
 using Motiva.Application.Administration;
 using Motiva.Application.Common;
@@ -42,9 +43,9 @@ internal static class DirectoryEndpoints
             [FromServices] CatalogService catalog, HttpContext http,
             [FromQuery] int? limit, [FromQuery] string? cursor, [FromQuery] string? status, CancellationToken ct) =>
         {
-            var (items, asOf) = await catalog.ListResourcesAsync(
-                http.Actor(), status is null ? null : Enum.Parse<ResourceStatus>(status), Paging.NormalizeLimit(limit), cursor, ct);
-            return EndpointHelpers.Ok(new { items, nextCursor = (string?)null, asOfUtc = asOf });
+            var (items, nextCursor) = await catalog.ListResourcesAsync(
+                http.Actor(), status is null ? null : EndpointHelpers.ParseEnum<ResourceStatus>(status, "status"), Paging.NormalizeLimit(limit), cursor, ct);
+            return EndpointHelpers.Ok(new { items, nextCursor, asOfUtc = DateTimeOffset.UtcNow });
         });
         resources.MapPost("/", async (
             [FromServices] ResourcesService service, HttpContext http,
@@ -68,8 +69,8 @@ internal static class DirectoryEndpoints
             [FromServices] CatalogService catalog, HttpContext http,
             [FromQuery] int? limit, [FromQuery] string? cursor, CancellationToken ct) =>
         {
-            var (items, asOf) = await catalog.ListAchievementsAsync(http.Actor(), Paging.NormalizeLimit(limit), cursor, ct);
-            return EndpointHelpers.Ok(new { items, nextCursor = (string?)null, asOfUtc = asOf });
+            var (items, nextCursor) = await catalog.ListAchievementsAsync(http.Actor(), Paging.NormalizeLimit(limit), cursor, ct);
+            return EndpointHelpers.Ok(new { items, nextCursor, asOfUtc = DateTimeOffset.UtcNow });
         });
         achievements.MapPost("/", async (
             [FromServices] AchievementsService service, HttpContext http,
@@ -110,7 +111,7 @@ internal static class DirectoryEndpoints
             [FromServices] PurchaseSystemsService service, HttpContext http, [FromRoute] Guid id,
             [FromHeader(Name = "If-Match")] string? ifMatch, [FromBody] PurchaseSystemPatchRequest body, CancellationToken ct) =>
             (await service.PatchAsync(http.Actor(), id, ifMatch, body.Name,
-                body.Status is null ? null : Enum.Parse<ContentStatus>(body.Status), body.AcceptedResourceIds, ct)).ToResult());
+                body.Status is null ? null : EndpointHelpers.ParseEnum<ContentStatus>(body.Status, "status"), body.AcceptedResourceIds, ct)).ToResult());
 
         var grants = api.MapGroup("/integration-grants");
         grants.MapGet("/", async (
@@ -124,7 +125,7 @@ internal static class DirectoryEndpoints
             [FromServices] IntegrationGrantsService service, HttpContext http,
             [FromHeader(Name = "Idempotency-Key")] string? idempotencyKey,
             [FromBody] IntegrationGrantCreateRequest body, CancellationToken ct) =>
-            (await service.CreateAsync(http.Actor(), body.Subject, Enum.Parse<GrantKind>(body.Kind),
+            (await service.CreateAsync(http.Actor(), body.Subject, EndpointHelpers.ParseEnum<GrantKind>(body.Kind, "kind"),
                 body.CampaignId, body.ResourceId, body.PurchaseSystemId, idempotencyKey, ct)).ToResult());
         grants.MapGet("/{id:guid}", async (
             [FromServices] IntegrationGrantsService service, HttpContext http, [FromRoute] Guid id, CancellationToken ct) =>
@@ -140,10 +141,10 @@ internal static class DirectoryEndpoints
         api.MapGet("/audit-records", async (
             [FromServices] ReadService reads, HttpContext http,
             [FromQuery] int? limit, [FromQuery] string? cursor,
-            [FromQuery] DateTimeOffset? from, [FromQuery] DateTimeOffset? to,
+            [FromQuery] string? from, [FromQuery] string? to,
             [FromQuery] string? entityType, [FromQuery] string? entityId, CancellationToken ct) =>
         {
-            var page = await reads.ListAuditRecordsAsync(http.Actor(), Paging.NormalizeLimit(limit), cursor, from, to, entityType, entityId, ct);
+            var page = await reads.ListAuditRecordsAsync(http.Actor(), Paging.NormalizeLimit(limit), cursor, StrictDates.ParseOptionalUtc(from, "from"), StrictDates.ParseOptionalUtc(to, "to"), entityType, entityId, ct);
             return EndpointHelpers.Page(page, DtoMapper.ToDto);
         });
     }

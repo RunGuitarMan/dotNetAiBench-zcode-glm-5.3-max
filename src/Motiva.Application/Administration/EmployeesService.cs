@@ -7,16 +7,19 @@ namespace Motiva.Application.Administration;
 /// <summary>Employee profiles: creation gives exactly one wallet in the same transaction (B01.5);
 /// blocking/reactivation acts immediately for new requests (B05.1); every change is audited (B28.3).</summary>
 public sealed class EmployeesService(
+    CurrentRights rights,
     IEmployeeDirectory employees,
     IAuditLog audit,
     IUnitOfWork uow,
     IdempotencyGate gate,
     TimeProvider timeProvider)
 {
+    private const string locationPrefix = "/api/v1/employees/";
+
     public async Task<CommandResponse> CreateAsync(
         ActorContext actor, int masterId, IReadOnlyList<string> tags, string? idempotencyKey, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         Guard.MasterId(masterId);
         Guard.Tags(tags);
         var now = timeProvider.GetUtcNow();
@@ -25,7 +28,7 @@ public sealed class EmployeesService(
         var echo = await gate.BeginOrEchoAsync(actor.CompanyId, actor, "employee.create", "-", idempotencyKey, essential, ct);
         if (echo is not null)
         {
-            return new CommandResponse(echo.Status, echo.Body);
+            return new CommandResponse(echo.Status, echo.Body, echo.Location is not null ? locationPrefix + echo.Location : null);
         }
 
         var outcome = await employees.CreateAsync(actor.CompanyId, masterId, tags, now, ct);
@@ -48,7 +51,7 @@ public sealed class EmployeesService(
     public async Task<CommandResponse> PatchAsync(
         ActorContext actor, int masterId, string? ifMatch, bool? isActive, IReadOnlyList<string>? tags, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         var version = ETags.ParseRequired(ifMatch);
         if (tags is not null)
         {
@@ -101,7 +104,7 @@ public sealed class EmployeesService(
                 ?? throw new MotivaException(ErrorCode.NotFound);
         }
 
-        Authz.EnsureUser(actor);
+        await rights.EnsureActiveEmployeeAsync(actor, ct);
         if (actor.MasterId != masterId)
         {
             // A foreign personal object is indistinguishable from a missing one (B02.3, T04).
@@ -112,9 +115,9 @@ public sealed class EmployeesService(
             ?? throw new MotivaException(ErrorCode.NotFound);
     }
 
-    public Task<Page<EmployeeRec>> ListAsync(ActorContext actor, bool? active, int limit, string? cursor, CancellationToken ct)
+    public async Task<Page<EmployeeRec>> ListAsync(ActorContext actor, bool? active, int limit, string? cursor, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
-        return employees.ListAsync(actor.CompanyId, active, limit, cursor, ct);
+        await rights.EnsureAdminAsync(actor, ct);
+        return await employees.ListAsync(actor.CompanyId, active, limit, cursor, ct);
     }
 }

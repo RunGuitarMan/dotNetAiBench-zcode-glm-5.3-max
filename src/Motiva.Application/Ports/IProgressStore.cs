@@ -92,9 +92,10 @@ public sealed record MovementRow(
     Guid? OriginalOperationId,
     DateTimeOffset CreatedAtUtc);
 
-/// <summary>Streams posted wallet movements for CSV export without loading everything at once (T07).</summary>
-public interface IExportMovementSource
+/// <summary>Streams snapshot rows of a fixed export in the CSV contract order — keyset pages,
+/// bounded memory, no full materialization (T07).</summary>
+public interface ISnapshotRowSource
 {
-    IAsyncEnumerable<MovementRow> StreamMovementsAsync(
-        Guid companyId, IReadOnlyList<Guid> operationIds, Guid? resourceId, CancellationToken ct);
+    IAsyncEnumerable<MovementRow> StreamSnapshotRowsAsync(
+        Guid companyId, Guid exportId, Guid? resourceId, CancellationToken ct);
 }

@@ -9,6 +9,7 @@ x-api-env: &api-env
   Motiva__S3AccessKey: "motiva"
   Motiva__S3SecretKey: "motiva-stand-secret"
   Motiva__S3Bucket: "motiva-exports"
+  Motiva__S3PublicUrl: "http://localhost:9100"
   ASPNETCORE_ENVIRONMENT: "Production"
 
 services:
@@ -63,17 +64,6 @@ services:
     deploy:
       resources:
         limits: { cpus: "1", memory: 1g }
-
-  migrate:
-    build:
-      context: .
-      dockerfile: deploy/migrate.Dockerfile
-    environment:
-      Motiva__PostgresConnectionString: "Host=postgres;Port=5432;Database=motiva;Username=motiva;Password=motiva-stand"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    profiles: ["tools"]
 
   api:
     build:

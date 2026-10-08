@@ -132,6 +132,9 @@ for (var i = 0; i < 10; i++)
             }
         }
 
+        // One full-season challenge per campaign for the leaderboard branch of the load mix.
+        var challenge = await content.CreateChallengeAsync(admin, campaignId, streamId, seasonStart, seasonEnd, "seed-ch-" + i, CancellationToken.None);
+        Ok(challenge.Status, "challenge create");
         var current = await campaignsService.GetAsync(admin, campaignId, CancellationToken.None);
         var publish = await campaignsService.PatchAsync(admin, campaignId, ETags.Format(current.Version), null, null, null, CampaignStatus.Published, CancellationToken.None);
         Ok(publish.Status, "publish");
@@ -140,8 +143,16 @@ for (var i = 0; i < 10; i++)
     {
         campaignId = campaignRec.Id;
         var streams = await content.ListStreamsAsync(admin, campaignId, 100, null, CancellationToken.None);
-        var tasks = await content.ListTasksAsync(admin, streams.Items[0].Id, 100, null, CancellationToken.None);
+        var streamId0 = streams.Items[0].Id;
+        var tasks = await content.ListTasksAsync(admin, streamId0, 100, null, CancellationToken.None);
         firstTaskId = tasks.Items[0].Id;
+        var challenges = await content.ListChallengesAsync(admin, campaignId, 100, null, CancellationToken.None);
+        if (challenges.Items.Count == 0)
+        {
+            // Pre-publication content only: archived campaigns cannot gain challenges; the seed
+            // campaigns stay Published, so this re-run path is only for a fresh DB.
+            Console.WriteLine($"[seed] warning: campaign {code} has no challenge (created after publish?)");
+        }
     }
 
     foreach (var resourceId in resourceIds)
@@ -205,16 +216,24 @@ await Parallel.ForAsync(0, 100_000, new ParallelOptions { MaxDegreeOfParallelism
 });
 Console.WriteLine($"[seed] 100k events in {eventWatch.Elapsed.TotalSeconds:F0}s; completions: {completions} ({completions / 1000.0:F1}%)");
 
-// Wallet top-ups so the spend part of the mix has funds.
-await Parallel.ForAsync(0, 200, new ParallelOptions { MaxDegreeOfParallelism = 8 }, async (n, ct) =>
+// Wallet top-ups: EVERY seeded employee gets funds — the load mix spends 1 unit from a random
+// wallet, and a Posted business result requires sufficient funds (T09: "достаточно средств").
+await Parallel.ForAsync(2, 10_002, new ParallelOptions { MaxDegreeOfParallelism = 16 }, async (masterId, ct) =>
 {
     using var scope = services.CreateScope();
     var awards = scope.ServiceProvider.GetRequiredService<ManualAwardsService>();
-    var campaign = seeded[n % seeded.Count];
-    var response = await awards.AwardAsync(admin, campaign.CampaignId, 2 + n * 13, resourceIds[0], 1000, "seed spend funds", "SEED-MA-" + n, ct);
-    if (response.Status != 201 && !response.Body.Contains("same result"))
+    var campaign = seeded[masterId % seeded.Count];
+    try
     {
-        Ok(response.Status, "manual award " + n);
+        var response = await awards.AwardAsync(admin, campaign.CampaignId, masterId, resourceIds[0], 100, "seed spend funds", "SEED-MA-" + masterId, ct);
+        if (response.Status != 201)
+        {
+            throw new InvalidOperationException("top-up failed " + masterId + ": " + response.Status + " " + response.Body[..Math.Min(160, response.Body.Length)]);
+        }
+    }
+    catch (MotivaException ex) when (ex.Code == ErrorCode.ConflictBusinessNumber)
+    {
+        // already seeded
     }
 });
 // 100 000 historical movements: manual awards of 1 unit through the use case (B24 numbers).

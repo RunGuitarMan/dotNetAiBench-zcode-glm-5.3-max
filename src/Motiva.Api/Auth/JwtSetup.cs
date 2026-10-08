@@ -65,8 +65,9 @@ public static class JwtSetup
         return services;
     }
 
-    /// <summary>Every identity claim must be unambiguous; roles may combine Employee+Admin but
-    /// must not repeat the same value (03_AUTH).</summary>
+    /// <summary>Every identity claim must be present, unambiguous and compatible: a mandatory
+    /// non-empty subject; roles only for user actors and only Employee/Admin (Employee required);
+    /// service actors carry no role and no masterId (03_AUTH).</summary>
     internal static bool IdentityClaimsAreConsistent(ClaimsPrincipal principal)
     {
         string[] singletonClaims = [SubjectClaim, CompanyIdClaim, ActorTypeClaim, MasterIdClaim];
@@ -76,6 +77,12 @@ public static class JwtSetup
             {
                 return false;
             }
+        }
+
+        var subject = principal.FindFirst(SubjectClaim)?.Value;
+        if (string.IsNullOrWhiteSpace(subject))
+        {
+            return false;
         }
 
         var roles = principal.Claims.Where(c => string.Equals(c.Type, RoleClaim, StringComparison.Ordinal)).Select(c => c.Value).ToList();
@@ -92,10 +99,15 @@ public static class JwtSetup
             {
                 return false;
             }
+
+            if (roles.Count == 0 || roles.Any(r => r is not ("Employee" or "Admin")) || !roles.Contains("Employee"))
+            {
+                return false;
+            }
         }
         else if (actorType == "service")
         {
-            if (!string.IsNullOrEmpty(masterId))
+            if (!string.IsNullOrEmpty(masterId) || roles.Count != 0)
             {
                 return false;
             }

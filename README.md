@@ -25,7 +25,7 @@ Smoke: `curl -H "Authorization: Bearer $(cat auth/.local/tokens/employee123.jwt)
 |---|---|
 | `scripts/test.sh unit\|architecture\|persistence\|functional\|http\|e2e\|all` | группы тестов (T08); e2e — сценарии на живом стенде |
 | `scripts/verify-arch-gate.sh` | подсаженное компилируемое нарушение роняет арх-группу |
-| `scripts/load.sh seed\|main\|competitors\|export100k\|all` | подготовка профиля T09 и k6 |
+| `scripts/load.sh seed\|main\|competitors\|export100k\|degradation\|all` | подготовка профиля T09 и k6 |
 | `dotnet format Motiva.sln --verify-no-changes` | форматирование |
 
 Инфраструктура тестов — тот же compose-стенд (`localhost:5433/6380/9100`); тесты создают свои
@@ -47,4 +47,8 @@ root). Тесты: `tests/` по слоям; нагрузка: `load/`; сцен
 ## Ограничения стенда
 
 - Токены `jwt.py` действуют 1 час: долгие прогоны обновляйте `python3 auth/jwt.py prepare`.
+- Особенность обёртки (вход этапа, не изменялся): при первом запуске `prepare` в новом клоне
+  служебный проект создаётся без `appsettings*.json` и команда завершается ошибкой — выполните
+  `echo '{}' > auth/.local/issuer/appsettings.json && echo '{}' > auth/.local/issuer/appsettings.Development.json`
+  и повторите `prepare` (ключ и токены создаются штатно).
 - Секреты только в `auth/.local/` (вне Git); `.env.example` без секретов.

@@ -46,13 +46,14 @@ public static class DependencyInjection
         services.AddScoped<IProgressLog, ProgressStore>();
         services.AddScoped<ICompetitionBoard, CompetitionStore>();
         services.AddScoped<IExportStore, ExportStore>();
-        services.AddScoped<IExportMovementSource, MovementSource>();
+        services.AddScoped<ISnapshotRowSource, SnapshotRowSource>();
         services.AddScoped<IBackgroundJobs, OutboxStore>();
         services.AddScoped<IAuditLog, AuditStore>();
         services.AddScoped<IIdempotencyStore, IdempotencyStore>();
         services.AddScoped<IOperationsReadStore, OperationsReadStore>();
 
         services.AddSingleton<ICacheSnapshots, ValkeyCacheSnapshots>();
+        services.AddScoped<HealthChecks>();
         services.AddSingleton<IFileStorage, S3FileStorage>();
         return services;
     }

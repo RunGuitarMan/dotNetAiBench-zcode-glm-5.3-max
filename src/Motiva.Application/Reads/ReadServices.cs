@@ -12,7 +12,9 @@ namespace Motiva.Application.Reads;
 /// campaign progress. Personal data is scoped by the token subject; the owner sees campaign
 /// expenses only, never the participant wallets (B34.2, B35.5).</summary>
 public sealed class ReadService(
+    CurrentRights rights,
     IEmployeeDirectory employees,
+    IIntegrationDirectory grants,
     ICampaignCatalog campaigns,
     IWalletLedger wallets,
     IOperationsReadStore operationsRead,
@@ -30,25 +32,35 @@ public sealed class ReadService(
 
     public async Task<WalletDto> GetEmployeeWalletAsync(ActorContext actor, int masterId, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         Guard.MasterId(masterId);
         _ = await employees.GetAsync(actor.CompanyId, masterId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
         var balances = await wallets.GetWalletAsync(actor.CompanyId, masterId, ct);
         return new WalletDto(masterId, balances.Select(DtoMapper.ToDto).ToArray(), timeProvider.GetUtcNow());
     }
 
-    public Task<Page<OperationRec>> ListOwnOperationsAsync(
+    public async Task<Page<OperationRec>> ListOwnOperationsAsync(
         ActorContext actor, int limit, string? cursor, DateTimeOffset? from, DateTimeOffset? toUtc, Guid? resourceId,
         OperationKind? kind, OperationResult? result, CancellationToken ct)
     {
-        return operationsRead.ListOwnAsync(actor, limit, cursor, from, toUtc, resourceId, kind, result, ct);
+        if (actor.ActorType == ActorType.User)
+        {
+            // A blocked employee loses read access too (B05.1); a service reads by grant pairs.
+            await rights.EnsureActiveEmployeeAsync(actor, ct);
+        }
+        else
+        {
+            await EnsureServiceSpendGrantAsync(actor, ct);
+        }
+
+        return await operationsRead.ListOwnAsync(actor, limit, cursor, from, toUtc, resourceId, kind, result, ct);
     }
 
     public async Task<Page<OperationRec>> ListEmployeeOperationsAsync(
         ActorContext actor, int masterId, int limit, string? cursor, DateTimeOffset? from, DateTimeOffset? toUtc, Guid? resourceId,
         OperationKind? kind, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         Guard.MasterId(masterId);
         _ = await employees.GetAsync(actor.CompanyId, masterId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
         return await operationsRead.ListForEmployeeAsync(actor, masterId, limit, cursor, from, toUtc, resourceId, kind, ct);
@@ -60,6 +72,17 @@ public sealed class ReadService(
         var campaign = await campaigns.GetAsync(actor.CompanyId, campaignId, ct) ?? throw new MotivaException(ErrorCode.NotFound);
         BudgetService.EnsureOwnerOrAdmin(actor, campaign);
         return await operationsRead.ListForCampaignAsync(actor, campaignId, limit, cursor, from, toUtc, resourceId, ct);
+    }
+
+    private async Task EnsureServiceSpendGrantAsync(ActorContext actor, CancellationToken ct)
+    {
+        // The service history right comes from a live Spend grant (§3.3); the store never
+        // decides this — the application raises the 403 before any read.
+        var pairs = await grants.ListActiveSpendPairsAsync(actor.CompanyId, actor.Subject, ct);
+        if (pairs.Count == 0)
+        {
+            throw new MotivaException(ErrorCode.AuthzGrantMissing);
+        }
     }
 
     public async Task<OperationRec> GetOperationAsync(ActorContext actor, Guid operationId, CancellationToken ct)
@@ -76,7 +99,7 @@ public sealed class ReadService(
     public async Task<Page<AchievementGrantRec>> ListOwnAchievementsAsync(
         ActorContext actor, int? season, int limit, string? cursor, CancellationToken ct)
     {
-        Authz.EnsureUser(actor);
+        await rights.EnsureActiveEmployeeAsync(actor, ct);
         return await progress.ListAchievementsAsync(actor.CompanyId, actor.MasterId!.Value, season, limit, cursor, ct);
     }
 
@@ -111,11 +134,11 @@ public sealed class ReadService(
         return await operationsRead.ListCampaignProgressAsync(actor, campaign, limit, cursor, streamId, ct);
     }
 
-    public Task<Page<AuditRec>> ListAuditRecordsAsync(
+    public async Task<Page<AuditRec>> ListAuditRecordsAsync(
         ActorContext actor, int limit, string? cursor, DateTimeOffset? from, DateTimeOffset? toUtc, string? entityType, string? entityId, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
-        return operationsRead.ListAuditAsync(actor.CompanyId, limit, cursor, from, toUtc, entityType, entityId, ct);
+        await rights.EnsureAdminAsync(actor, ct);
+        return await operationsRead.ListAuditAsync(actor.CompanyId, limit, cursor, from, toUtc, entityType, entityId, ct);
     }
 }
 

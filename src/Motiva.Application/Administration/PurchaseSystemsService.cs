@@ -6,6 +6,7 @@ namespace Motiva.Application.Administration;
 
 /// <summary>Purchase systems and their accepted resources (B23.4) — administered by the company admin.</summary>
 public sealed class PurchaseSystemsService(
+    CurrentRights rights,
     IPurchaseSystemDirectory systems,
     IResourceDirectory resources,
     IAuditLog audit,
@@ -13,10 +14,12 @@ public sealed class PurchaseSystemsService(
     IdempotencyGate gate,
     TimeProvider timeProvider)
 {
+    private const string locationPrefix = "/api/v1/purchase-systems/";
+
     public async Task<CommandResponse> CreateAsync(
         ActorContext actor, string? rawCode, string name, IReadOnlyList<Guid> acceptedResourceIds, string? idempotencyKey, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         var code = Guard.Code(rawCode);
         Guard.Name(name);
         var now = timeProvider.GetUtcNow();
@@ -25,7 +28,7 @@ public sealed class PurchaseSystemsService(
         var echo = await gate.BeginOrEchoAsync(actor.CompanyId, actor, "purchase-system.create", "-", idempotencyKey, essential, ct);
         if (echo is not null)
         {
-            return new CommandResponse(echo.Status, echo.Body);
+            return new CommandResponse(echo.Status, echo.Body, echo.Location is not null ? locationPrefix + echo.Location : null);
         }
 
         await EnsureResourcesExistAsync(actor, acceptedResourceIds, ct);
@@ -54,7 +57,7 @@ public sealed class PurchaseSystemsService(
         IReadOnlyList<Guid>? acceptedResourceIds,
         CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         var version = ETags.ParseRequired(ifMatch);
         if (name is not null)
         {
@@ -117,10 +120,10 @@ public sealed class PurchaseSystemsService(
     public async Task<PurchaseSystemRec> GetAsync(ActorContext actor, Guid id, CancellationToken ct)
         => await systems.GetAsync(actor.CompanyId, id, ct) ?? throw new MotivaException(ErrorCode.NotFound);
 
-    public Task<Page<PurchaseSystemRec>> ListAsync(ActorContext actor, int limit, string? cursor, CancellationToken ct)
+    public async Task<Page<PurchaseSystemRec>> ListAsync(ActorContext actor, int limit, string? cursor, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
-        return systems.ListAsync(actor.CompanyId, limit, cursor, ct);
+        await rights.EnsureAdminAsync(actor, ct);
+        return await systems.ListAsync(actor.CompanyId, limit, cursor, ct);
     }
 
     private async Task EnsureResourcesExistAsync(ActorContext actor, IReadOnlyList<Guid> acceptedResourceIds, CancellationToken ct)
@@ -134,6 +137,12 @@ public sealed class PurchaseSystemsService(
         if (found.Count != acceptedResourceIds.Distinct().Count())
         {
             throw new MotivaException(ErrorCode.ValidationFailed, "acceptedResourceIds must reference company resources.");
+        }
+
+        if (found.Any(r => r.Status == ResourceStatus.Archived))
+        {
+            // An archived resource cannot enter new settings (B07.2).
+            throw new MotivaException(ErrorCode.ValidationFailed, "Archived resources cannot be accepted by a purchase system.");
         }
     }
 }

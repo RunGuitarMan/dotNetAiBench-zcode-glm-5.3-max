@@ -63,10 +63,13 @@ public sealed class ProjectDependencyTests
     [Fact]
     public void Endpoints_and_worker_orchestration_never_touch_dbcontext_npgsql_or_s3()
     {
-        // Only Program.cs (composition root) may reference Infrastructure types.
+        // Only Program.cs (composition root) may reference Infrastructure types; the shared
+        // metrics type lives in Infrastructure and is referenced by the ProblemDetails
+        // middleware — allow exactly that one namespace-level exception (metrics wiring).
         var offenderResult = Types.InAssembly(ArchitectureRules.Api)
             .That()
             .DoNotHaveName("Program")
+            .And().DoNotHaveName("ProblemDetailsMiddleware")
             .ShouldNot()
             .HaveDependencyOnAny(
                 "Microsoft.EntityFrameworkCore",

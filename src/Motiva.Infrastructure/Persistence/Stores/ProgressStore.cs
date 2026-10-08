@@ -206,7 +206,7 @@ public sealed class ProgressStore(MotivaDbContext db) : IProgressLog
     public async Task<Page<AchievementGrantRec>> ListAchievementsAsync(
         Guid companyId, int masterId, int? season, int limit, string? cursor, CancellationToken ct)
     {
-        var boundary = CursorCodec.Decode<SeasonTimeCursor>(cursor);
+        var boundary = CursorCodec.Decode<SeasonTimeAchievementCursor>(cursor);
         var query = from g in db.AchievementGrants
                     join a in db.Achievements on new { g.CompanyId, Id = g.AchievementId } equals new { a.CompanyId, a.Id }
                     where g.CompanyId == companyId && g.MasterId == masterId
@@ -218,28 +218,32 @@ public sealed class ProgressStore(MotivaDbContext db) : IProgressLog
 
         if (boundary is not null)
         {
-            query = query.Where(x => x.g.Season > boundary.Season || (x.g.Season == boundary.Season && x.g.GrantedAt > boundary.At));
+            // Unique tie-breaker (achievementId): equal timestamps never skip a row (T04).
+            query = query.Where(x =>
+                x.g.Season > boundary.Season
+                || (x.g.Season == boundary.Season && x.g.GrantedAt > boundary.At)
+                || (x.g.Season == boundary.Season && x.g.GrantedAt == boundary.At && x.g.AchievementId.CompareTo(boundary.AchievementId) > 0));
         }
 
-        var rows = await query.OrderBy(x => x.g.Season).ThenBy(x => x.g.GrantedAt).Take(limit + 1).ToListAsync(ct);
+        var rows = await query.OrderBy(x => x.g.Season).ThenBy(x => x.g.GrantedAt).ThenBy(x => x.g.AchievementId).Take(limit + 1).ToListAsync(ct);
         var items = rows.Take(limit)
             .Select(x => new AchievementGrantRec(x.g.AchievementId, x.a.CodeNorm, x.a.Name, x.g.Season, x.g.GrantedAt))
             .ToList();
         var next = rows.Count > limit
-            ? CursorCodec.Encode(new SeasonTimeCursor(items[^1].Season, items[^1].GrantedAtUtc))
+            ? CursorCodec.Encode(new SeasonTimeAchievementCursor(items[^1].Season, items[^1].GrantedAtUtc, items[^1].AchievementId))
             : null;
         return new Page<AchievementGrantRec>(items, next);
     }
 
-    public Task<IReadOnlyList<MilestoneRec>> GetCrossedMilestonesAsync(
+    public async Task<IReadOnlyList<MilestoneRec>> GetCrossedMilestonesAsync(
         Guid companyId, Guid streamId, long pointsBefore, long pointsAfter, CancellationToken ct)
     {
-        return Task.FromResult<IReadOnlyList<MilestoneRec>>(
-            db.Milestones
-                .Where(m => m.StreamId == streamId && m.Threshold > pointsBefore && m.Threshold <= pointsAfter)
-                .OrderBy(m => m.Threshold)
-                .Select(m => new MilestoneRec(m.Id, m.StreamId, m.Threshold, m.AchievementId, m.Version))
-                .ToList());
+        var rows = await db.Milestones
+            .Where(m => m.StreamId == streamId && m.Threshold > pointsBefore && m.Threshold <= pointsAfter)
+            .OrderBy(m => m.Threshold)
+            .Select(m => new { m.Id, m.StreamId, m.Threshold, m.AchievementId, m.Version })
+            .ToListAsync(ct);
+        return rows.Select(m => new MilestoneRec(m.Id, m.StreamId, m.Threshold, m.AchievementId, m.Version)).ToList();
     }
 
     internal static ProgressEventRec ToRec(ProgressEventRow row)
@@ -256,5 +260,5 @@ public sealed class ProgressStore(MotivaDbContext db) : IProgressLog
             row.EssentialData, row.ResponseStatus, row.ResponseBody);
     }
 
-    internal sealed record SeasonTimeCursor(int Season, DateTimeOffset At);
+    internal sealed record SeasonTimeAchievementCursor(int Season, DateTimeOffset At, Guid AchievementId);
 }

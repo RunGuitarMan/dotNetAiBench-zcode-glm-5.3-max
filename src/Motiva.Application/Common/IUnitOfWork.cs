@@ -56,6 +56,7 @@ public static class Checkpoints
     public const string ProgressAfterLocksBeforeTime = "progress.after-locks-before-time";
     public const string ProgressBeforeCommit = "progress.before-commit";
     public const string ProgressAfterCommitBeforeResponse = "progress.after-commit-before-response";
+    public const string ManualAwardBeforeCommit = "manual-award.before-commit";
     public const string ExportBeforeSnapshotCommit = "export.before-snapshot-commit";
     public const string ExportAfterUploadBeforeReady = "export.after-upload-before-ready";
 }

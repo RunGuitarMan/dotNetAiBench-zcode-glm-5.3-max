@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Motiva.Api.Infrastructure;
 using Motiva.Application.Campaigns;
 using Motiva.Application.Common;
 using Motiva.Application.Dto;
@@ -19,7 +20,7 @@ internal static class CampaignEndpoints
             [FromQuery] int? limit, [FromQuery] string? cursor, [FromQuery] int? season, [FromQuery] string? status, CancellationToken ct) =>
         {
             var (items, asOf) = await catalog.ListCampaignsAsync(
-                http.Actor(), season, status is null ? null : Enum.Parse<CampaignStatus>(status), Paging.NormalizeLimit(limit), cursor, ct);
+                http.Actor(), season, status is null ? null : EndpointHelpers.ParseEnum<CampaignStatus>(status, "status"), Paging.NormalizeLimit(limit), cursor, ct);
             return EndpointHelpers.Ok(new { items, nextCursor = (string?)null, asOfUtc = asOf });
         });
         campaigns.MapPost("/", async (
@@ -28,7 +29,9 @@ internal static class CampaignEndpoints
             [FromBody] CampaignCreateRequest body, CancellationToken ct) =>
             (await service.CreateAsync(
                 http.Actor(), body.Code, body.Name, body.Description, body.OwnerMasterId,
-                body.StartsAt, body.EndsAt, body.Audience, idempotencyKey, ct)).ToResult());
+                StrictDates.ParseRequiredUtc(body.StartsAt, "startsAt"),
+                StrictDates.ParseRequiredUtc(body.EndsAt, "endsAt"),
+                body.Audience, idempotencyKey, ct)).ToResult());
         campaigns.MapGet("/{id:guid}", async (
             [FromServices] CampaignsService service, HttpContext http, [FromRoute] Guid id, CancellationToken ct) =>
         {
@@ -40,7 +43,7 @@ internal static class CampaignEndpoints
             [FromHeader(Name = "If-Match")] string? ifMatch, [FromBody] CampaignPatchRequest body, CancellationToken ct) =>
             (await service.PatchAsync(
                 http.Actor(), id, ifMatch, body.Name, body.Description, body.Audience,
-                body.Status is null ? null : Enum.Parse<CampaignStatus>(body.Status), ct)).ToResult());
+                body.Status is null ? null : EndpointHelpers.ParseEnum<CampaignStatus>(body.Status, "status"), ct)).ToResult());
         campaigns.MapDelete("/{id:guid}", async (
             [FromServices] CampaignsService service, HttpContext http, [FromRoute] Guid id,
             [FromHeader(Name = "If-Match")] string? ifMatch, CancellationToken ct) =>
@@ -75,7 +78,10 @@ internal static class CampaignEndpoints
             [FromServices] CampaignContentService service, HttpContext http, [FromRoute] Guid id,
             [FromHeader(Name = "Idempotency-Key")] string? idempotencyKey,
             [FromBody] ChallengeCreateRequest body, CancellationToken ct) =>
-            (await service.CreateChallengeAsync(http.Actor(), id, body.StreamId, body.StartsAt, body.EndsAt, idempotencyKey, ct)).ToResult());
+            (await service.CreateChallengeAsync(
+                http.Actor(), id, body.StreamId,
+                StrictDates.ParseRequiredUtc(body.StartsAt, "startsAt"),
+                StrictDates.ParseRequiredUtc(body.EndsAt, "endsAt"), idempotencyKey, ct)).ToResult());
         campaigns.MapGet("/{id:guid}/challenges", async (
             [FromServices] CampaignContentService service, HttpContext http,
             [FromRoute] Guid id, [FromQuery] int? limit, [FromQuery] string? cursor, CancellationToken ct) =>
@@ -94,7 +100,7 @@ internal static class CampaignEndpoints
             [FromServices] CampaignContentService service, HttpContext http, [FromRoute] Guid id,
             [FromHeader(Name = "If-Match")] string? ifMatch, [FromBody] StreamPatchRequest body, CancellationToken ct) =>
             (await service.PatchStreamAsync(http.Actor(), id, ifMatch, body.Name,
-                body.Status is null ? null : Enum.Parse<ContentStatus>(body.Status), ct)).ToResult());
+                body.Status is null ? null : EndpointHelpers.ParseEnum<ContentStatus>(body.Status, "status"), ct)).ToResult());
         api.MapGet("/streams/{id:guid}/tasks", async (
             [FromServices] CampaignContentService service, HttpContext http,
             [FromRoute] Guid id, [FromQuery] int? limit, [FromQuery] string? cursor, CancellationToken ct) =>
@@ -108,7 +114,7 @@ internal static class CampaignEndpoints
             [FromBody] TaskCreateRequest body, CancellationToken ct) =>
             (await service.CreateTaskAsync(
                 http.Actor(), id, body.Code, body.Name, body.Description, body.Goal,
-                Enum.Parse<PeriodKind>(body.Period), body.StreamPoints,
+                EndpointHelpers.ParseEnum<PeriodKind>(body.Period, "period"), body.StreamPoints,
                 body.RewardItems?.Select(r => new RewardItemDto(r.ResourceId, r.Amount)).ToArray() ?? [],
                 body.Audience, idempotencyKey, ct)).ToResult());
         api.MapGet("/streams/{id:guid}/milestones", async (
@@ -135,10 +141,10 @@ internal static class CampaignEndpoints
             [FromHeader(Name = "If-Match")] string? ifMatch, [FromBody] TaskPatchRequest body, CancellationToken ct) =>
             (await service.PatchTaskAsync(
                 http.Actor(), id, ifMatch, body.Name, body.Description, body.Goal,
-                body.Period is null ? null : Enum.Parse<PeriodKind>(body.Period), body.StreamPoints,
+                body.Period is null ? null : EndpointHelpers.ParseEnum<PeriodKind>(body.Period, "period"), body.StreamPoints,
                 body.RewardItems?.Select(r => new RewardItemDto(r.ResourceId, r.Amount)).ToArray(),
                 body.Audience,
-                body.Status is null ? null : Enum.Parse<ContentStatus>(body.Status), ct)).ToResult());
+                body.Status is null ? null : EndpointHelpers.ParseEnum<ContentStatus>(body.Status, "status"), ct)).ToResult());
 
         api.MapGet("/milestones/{id:guid}", async (
             [FromServices] CampaignContentService service, HttpContext http, [FromRoute] Guid id, CancellationToken ct) =>
@@ -165,7 +171,7 @@ internal static class CampaignEndpoints
 
     public sealed record CampaignCreateRequest(
         string Code, string Name, string? Description, int OwnerMasterId,
-        DateTimeOffset StartsAt, DateTimeOffset EndsAt, AudienceDto? Audience);
+        string StartsAt, string EndsAt, AudienceDto? Audience);
 
     public sealed record CampaignPatchRequest(string? Name, string? Description, AudienceDto? Audience, string? Status);
 
@@ -189,5 +195,5 @@ internal static class CampaignEndpoints
 
     public sealed record MilestoneCreateRequest(long Threshold, Guid AchievementId);
 
-    public sealed record ChallengeCreateRequest(Guid StreamId, DateTimeOffset StartsAt, DateTimeOffset EndsAt);
+    public sealed record ChallengeCreateRequest(Guid StreamId, string StartsAt, string EndsAt);
 }

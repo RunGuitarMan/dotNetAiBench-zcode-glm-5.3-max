@@ -88,16 +88,24 @@ public sealed class ExportTests(MotivaFunctionalFixture fixture)
         var order = await exports.CreateAsync(world.Employee(1200), ExportScope.Own, null, a, from, to, "exp-c1", CancellationToken.None);
         var exportId = Guid.Parse(TestWorld.ParseJson(order.Body).GetProperty("id").GetString()!);
 
-        // Pause inside the award right before commit while the clock is early; let the snapshot
-        // start later: a timestamp filter would include it, the consistent snapshot must not.
-        // (The award runs in its own transaction; we simulate the late commit by pausing the
-        // export snapshot between the order and a concurrently committed movement.)
-        fixture.Host.Clock.SetUtcNow(new DateTimeOffset(2026, 6, 1, 10, 4, 0, TimeSpan.Zero));
+        // A movement with an early createdAt whose COMMIT is delayed beyond the snapshot start:
+        // the award holds its transaction open (before-commit seam) while the snapshot forms.
+        // A timestamp filter would include the row; the consistent MVCC snapshot must not (B36/T07).
+        fixture.Host.Clock.SetUtcNow(new DateTimeOffset(2026, 6, 1, 10, 2, 0, TimeSpan.Zero));
+        fixture.Host.Impediments.PauseOn(Checkpoints.ManualAwardBeforeCommit);
+        var lateAward = Task.Run(() => world.Resolve<ManualAwardsService>().AwardAsync(
+            world.Admin, campaignId, 1200, a, 7, "late commit", "MA-LATE", CancellationToken.None));
+        await Task.Delay(300); // the award row exists with createdAt 10:02 but is not committed
+
+        fixture.Host.Clock.SetUtcNow(new DateTimeOffset(2026, 6, 1, 10, 5, 0, TimeSpan.Zero));
         await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None);
+        fixture.Host.Impediments.Release(Checkpoints.ManualAwardBeforeCommit);
+        await lateAward;
+
         var state = await exports.GetAsync(world.Employee(1200), exportId, CancellationToken.None);
         var csv = await DownloadAsync(world, state);
         var sum = csv.Split('\n', StringSplitOptions.RemoveEmptyEntries).Skip(1).Select(l => long.Parse(l.Split(',')[3])).Sum();
-        Assert.Equal(3, sum); // only the arrange reward; the 10:02 movement of the other test's world is absent
+        Assert.Equal(3, sum); // only the earlier committed reward; the late-committed 10:02 movement is excluded
     }
 
     [Fact]
@@ -111,25 +119,29 @@ public sealed class ExportTests(MotivaFunctionalFixture fixture)
         var order = await exports.CreateAsync(world.Employee(1200), ExportScope.Own, null, a, from, to, "exp-c2", CancellationToken.None);
         var exportId = Guid.Parse(TestWorld.ParseJson(order.Body).GetProperty("id").GetString()!);
 
-        // gen=1 starts, but the worker dies before Ready; the lease expires; gen=2 wins.
-        var store = world.Resolve<IExportStore>();
-        var first = await store.TryStartFormingAsync(world.CompanyId, exportId, "worker-A", TimeSpan.FromMilliseconds(1), CancellationToken.None);
-        Assert.True(first.Started);
-        Assert.Equal(1, first.NewGeneration);
-        await Task.Delay(50);
-        var second = await store.TryStartFormingAsync(world.CompanyId, exportId, "worker-B", TimeSpan.FromMilliseconds(1), CancellationToken.None);
-        Assert.True(second.Started);
-        Assert.Equal(2, second.NewGeneration);
-        await Task.Delay(50);
+        // Worker A runs the REAL handler path and dies (pause) after its upload; the lease is
+        // 60 s of wall/service time — the fake clock advances past it deterministically.
+        fixture.Host.Impediments.PauseOn(Checkpoints.ExportAfterUploadBeforeReady);
+        var workerA = Task.Run(() => world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None));
+        await Task.Delay(300); // A holds Forming(gen=1) with its upload done
 
-        // The stale gen=1 attempt cannot mark Ready or Error (CAS by generation).
-        Assert.False(await store.TryMarkReadyAsync(world.CompanyId, exportId, "worker-A", 1, "k1", "v1", 10, "c1", DateTimeOffset.UtcNow, CancellationToken.None));
-        Assert.False(await store.TryMarkErrorAsync(world.CompanyId, exportId, "worker-A", 1, "stale", CancellationToken.None));
-
+        // Lease expiry by the service clock: worker B takes over through the same handler path.
+        fixture.Host.Clock.Advance(TimeSpan.FromSeconds(61));
         await world.Resolve<ExportFormationHandler>().HandleAsync(exportId, CancellationToken.None);
-        var state = await exports.GetAsync(world.Employee(1200), exportId, CancellationToken.None);
-        Assert.Equal(ExportStatus.Ready, state.Status);
-        Assert.True(state.Generation >= 2, "the winner generation must be later than the stale attempt");
+        var winner = await exports.GetAsync(world.Employee(1200), exportId, CancellationToken.None);
+        Assert.Equal(ExportStatus.Ready, winner.Status);
+        Assert.Equal(2, winner.Generation);
+
+        // Worker A resumes and CANNOT overwrite the winner: Ready CAS by generation fails.
+        fixture.Host.Impediments.Release(Checkpoints.ExportAfterUploadBeforeReady);
+        await workerA;
+        var afterStale = await exports.GetAsync(world.Employee(1200), exportId, CancellationToken.None);
+        Assert.Equal(ExportStatus.Ready, afterStale.Status);
+        Assert.Equal(2, afterStale.Generation);
+
+        // The winner's bytes are what downloads return (§3.6: unique per-attempt keys).
+        var csv = await DownloadAsync(world, winner);
+        Assert.StartsWith("operationId,masterId", csv);
     }
 
     [Fact]

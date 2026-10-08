@@ -80,10 +80,11 @@ public sealed class OutboxStore(MotivaDbContext db) : IBackgroundJobs
     public async Task<IReadOnlyList<OutboxJob>> ClaimAsync(string workerId, int batch, DateTimeOffset utcNow, CancellationToken ct)
     {
         await db.Database.ExecuteSqlInterpolatedAsync($"""
-            UPDATE outbox_jobs SET locked_by = {workerId}, locked_until = {utcNow.AddSeconds(30)}, status = 'Running'
+            UPDATE outbox_jobs SET locked_by = {workerId}, locked_until = {utcNow.AddSeconds(30)}, status = 'Running', attempts = attempts + 1
             WHERE id IN (
                 SELECT id FROM outbox_jobs
-                WHERE status = 'Pending' AND available_at <= {utcNow}
+                WHERE (status = 'Pending' AND available_at <= {utcNow})
+                   OR (status = 'Running' AND locked_until < {utcNow})
                 ORDER BY available_at
                 LIMIT {batch}
                 FOR UPDATE SKIP LOCKED)

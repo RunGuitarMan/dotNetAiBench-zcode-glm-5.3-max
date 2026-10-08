@@ -8,6 +8,8 @@ const SRC = __ENV.SRC_TOKEN;
 const EMP = __ENV.EMP_TOKEN;
 const CAMPAIGN_TASKS = JSON.parse(__ENV.RACE_TARGETS || '[]');
 
+const raceOutcomes = [];
+
 export const options = {
   scenarios: {
     racers: {
@@ -16,6 +18,7 @@ export const options = {
       iterations: 1,
       startTime: '2s',
       maxDuration: '30s',
+      gracefulStop: '5s',
     },
   },
 };
@@ -33,13 +36,25 @@ export default function () {
   const r = http.post(BASE + '/api/v1/progress-events', body, {
     headers: { Authorization: 'Bearer ' + SRC, 'Content-Type': 'application/json' },
   });
+  const parsed = r.status === 201 ? JSON.parse(r.body) : {};
+  const outcome = parsed.completion?.reward?.outcome;
+  // Two VUs share one target: exactly one Granted and one DeclinedInsufficientBudget must
+  // be the TOTAL outcome — each VU records its own outcome; the report aggregates them.
   check(r, {
     'race processed': (res) => res.status === 201,
-    'not a half-result': (res) => {
-      if (res.status !== 201) return false;
-      const outcome = JSON.parse(res.body).completion?.reward?.outcome;
-      return outcome === 'Granted' || outcome === 'DeclinedInsufficientBudget';
-    },
+    'race credited to goal': () => parsed.creditedDelta === target.goal,
+    'definite outcome': () => outcome === 'Granted' || outcome === 'DeclinedInsufficientBudget',
   });
+  raceOutcomes.push(outcome || 'http-' + r.status);
   sleep(0.2);
+}
+
+export function teardown() {
+  if (raceOutcomes.length === 2) {
+    const granted = raceOutcomes.filter((o) => o === 'Granted').length;
+    const declined = raceOutcomes.filter((o) => o === 'DeclinedInsufficientBudget').length;
+    if (granted !== 1 || declined !== 1) {
+      console.error('RACE INVARIANT BROKEN: ' + JSON.stringify(raceOutcomes));
+    }
+  }
 }

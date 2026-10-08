@@ -8,6 +8,7 @@ namespace Motiva.Application.Exports;
 /// successful formation start, not at the order; links live ≤ 60 s; deletion forbids new links
 /// immediately and the cleanup worker removes the bytes.</summary>
 public sealed class ExportsService(
+    CurrentRights rights,
     IExportStore exports,
     IResourceDirectory resources,
     IEmployeeDirectory employees,
@@ -17,6 +18,8 @@ public sealed class ExportsService(
     IdempotencyGate gate,
     TimeProvider timeProvider)
 {
+    private const string locationPrefix = "/api/v1/exports/";
+
     public async Task<CommandResponse> CreateAsync(
         ActorContext actor,
         ExportScope scope,
@@ -32,6 +35,7 @@ public sealed class ExportsService(
             throw new MotivaException(ErrorCode.AuthzForbidden, "Exports are ordered by employees and administrators only.");
         }
 
+        await rights.EnsureActiveEmployeeAsync(actor, ct);
         Guard.Range(fromUtc, toUtc);
         if (scope != ExportScope.Own && !actor.IsAdmin)
         {
@@ -69,7 +73,7 @@ public sealed class ExportsService(
         var echo = await gate.BeginOrEchoAsync(actor.CompanyId, actor, "export.create", "-", idempotencyKey, essential, ct);
         if (echo is not null)
         {
-            return new CommandResponse(echo.Status, echo.Body);
+            return new CommandResponse(echo.Status, echo.Body, echo.Location is not null ? locationPrefix + echo.Location : null);
         }
 
         var id = Guid.NewGuid();
@@ -98,12 +102,14 @@ public sealed class ExportsService(
 
     public async Task<Page<ExportRec>> ListAsync(ActorContext actor, int limit, string? cursor, CancellationToken ct)
     {
+        await rights.EnsureActiveEmployeeAsync(actor, ct);
         if (actor.IsAdmin)
         {
+            // OpenAPI GET /exports: administrators list company-wide requests; the export
+            // resource itself (status/links) stays requester-only via EnsureRequesterAsync.
             return await exports.ListAsync(actor.CompanyId, null, limit, cursor, ct);
         }
 
-        Authz.EnsureUser(actor);
         return await exports.ListAsync(actor.CompanyId, actor.MasterId!.Value, limit, cursor, ct);
     }
 
@@ -149,7 +155,7 @@ public sealed class ExportsService(
         var echo = await gate.BeginOrEchoAsync(actor.CompanyId, actor, "download-link.create", exportId.ToString(), idempotencyKey, essential, ct);
         if (echo is not null)
         {
-            return new CommandResponse(echo.Status, echo.Body);
+            return new CommandResponse(echo.Status, echo.Body, echo.Location is not null ? locationPrefix + echo.Location : null);
         }
 
         var now = timeProvider.GetUtcNow();
@@ -183,13 +189,18 @@ public sealed class ExportsService(
 
     private async Task EnsureRequesterAsync(ActorContext actor, ExportRec export, CancellationToken ct)
     {
-        // The requester keeps their current rights: only the ordering employee/administrator
-        // reads the export; the initiator must still be an active profile (B37.1, B05).
-        var requester = await employees.GetAsync(actor.CompanyId, actor.MasterId!.Value, ct);
-        Authz.EnsureActiveUser(actor, requester);
-        if (!actor.IsAdmin && actor.MasterId != export.RequestedByMasterId)
+        // B37.1: only the ordering employee reads the export, and they must still hold the
+        // rights of the ordered scope — losing the Admin role closes Company/Employee exports;
+        // no other user (admin or not) gets the resource (B05, B37).
+        await rights.EnsureActiveEmployeeAsync(actor, ct);
+        if (actor.MasterId != export.RequestedByMasterId)
         {
             throw new MotivaException(ErrorCode.NotFound);
+        }
+
+        if (export.Scope != ExportScope.Own && !actor.IsAdmin)
+        {
+            throw new MotivaException(ErrorCode.AuthzForbidden, "The scope of this export requires the administrator role.");
         }
     }
 }

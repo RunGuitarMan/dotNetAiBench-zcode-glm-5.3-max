@@ -8,7 +8,8 @@ public static class Authz
 {
     public static void EnsureAdmin(ActorContext actor)
     {
-        if (!actor.IsAdmin)
+        // The Admin role exists only for user actors; a service token never gains it (03_AUTH).
+        if (actor.ActorType != ActorType.User || !actor.IsAdmin)
         {
             throw new MotivaException(ErrorCode.AuthzForbidden, "Administrator role required.");
         }

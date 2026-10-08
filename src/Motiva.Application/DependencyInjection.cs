@@ -19,6 +19,7 @@ public static class DependencyInjection
         services.AddSingleton(TimeProvider.System);
         services.AddSingleton<ITestImpediments>(NoOpImpediments.Instance);
         services.AddScoped<IdempotencyGate>();
+        services.AddScoped<CurrentRights>();
 
         services.AddScoped<EmployeesService>();
         services.AddScoped<ResourcesService>();

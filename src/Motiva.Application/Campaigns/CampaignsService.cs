@@ -10,6 +10,7 @@ namespace Motiva.Application.Campaigns;
 /// AMB-12 content check, immutable economic fields after publication, aggregate-level
 /// strong ETag (campaigns.version), draft tombstone delete preserving financial history.</summary>
 public sealed class CampaignsService(
+    CurrentRights rights,
     ICampaignCatalog campaigns,
     IEmployeeDirectory employees,
     IResourceDirectory resources,
@@ -21,6 +22,8 @@ public sealed class CampaignsService(
     IdempotencyGate gate,
     TimeProvider timeProvider)
 {
+    private const string locationPrefix = "/api/v1/campaigns/";
+
     public async Task<CommandResponse> CreateAsync(
         ActorContext actor,
         string? rawCode,
@@ -33,7 +36,7 @@ public sealed class CampaignsService(
         string? idempotencyKey,
         CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         var code = Guard.Code(rawCode);
         Guard.Name(name);
         Guard.Description(description);
@@ -63,7 +66,7 @@ public sealed class CampaignsService(
         var echo = await gate.BeginOrEchoAsync(actor.CompanyId, actor, "campaign.create", "-", idempotencyKey, essential, ct);
         if (echo is not null)
         {
-            return new CommandResponse(echo.Status, echo.Body);
+            return new CommandResponse(echo.Status, echo.Body, echo.Location is not null ? locationPrefix + echo.Location : null);
         }
 
         var id = Guid.NewGuid();
@@ -110,7 +113,7 @@ public sealed class CampaignsService(
         var now = timeProvider.GetUtcNow();
         await using var scope = await uow.BeginAsync(ct);
         var before = await campaigns.GetAsync(actor.CompanyId, id, ct) ?? throw new MotivaException(ErrorCode.NotFound);
-        EnsureCanConfigure(actor, before);
+        await EnsureCanConfigureAsync(actor, before, ct);
         if (status == CampaignStatus.Published)
         {
             await EnsurePublishableAsync(actor, before, ct);
@@ -160,7 +163,7 @@ public sealed class CampaignsService(
         var now = timeProvider.GetUtcNow();
         await using var scope = await uow.BeginAsync(ct);
         var campaign = await campaigns.GetAsync(actor.CompanyId, id, ct) ?? throw new MotivaException(ErrorCode.NotFound);
-        EnsureCanConfigure(actor, campaign);
+        await EnsureCanConfigureAsync(actor, campaign, ct);
         var outcome = await campaigns.DeleteDraftAsync(actor.CompanyId, id, version, ct);
         outcome.EnsureOk();
         await audit.AppendAsync(
@@ -173,7 +176,7 @@ public sealed class CampaignsService(
 
     public async Task<CommandResponse> PutOwnerAsync(ActorContext actor, Guid id, string? ifMatch, int ownerMasterId, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         var version = ETags.ParseRequired(ifMatch);
         Guard.MasterId(ownerMasterId);
         var now = timeProvider.GetUtcNow();
@@ -205,7 +208,7 @@ public sealed class CampaignsService(
         var now = timeProvider.GetUtcNow();
         await using var scope = await uow.BeginAsync(ct);
         var campaign = await campaigns.GetAsync(actor.CompanyId, id, ct) ?? throw new MotivaException(ErrorCode.NotFound);
-        EnsureCanConfigure(actor, campaign);
+        await EnsureCanConfigureAsync(actor, campaign, ct);
         if (campaign.Status != CampaignStatus.Draft)
         {
             throw new MotivaException(ErrorCode.ConflictState, "The resource set is immutable after publication.");
@@ -258,7 +261,7 @@ public sealed class CampaignsService(
             throw new MotivaException(ErrorCode.NotFound);
         }
 
-        EnsureCanConfigure(actor, campaign);
+        await EnsureCanConfigureAsync(actor, campaign, ct);
         return await campaigns.ListResourcesAsync(actor.CompanyId, id, ct);
     }
 
@@ -282,18 +285,11 @@ public sealed class CampaignsService(
         return campaign;
     }
 
-    /// <summary>Owner or admin may configure the campaign; the owner right follows the current owner (B05.1).</summary>
-    public static void EnsureCanConfigure(ActorContext actor, CampaignRec campaign)
+    /// <summary>Owner or admin may configure the campaign; the right follows the current owner
+    /// and requires an active profile — including for replays (B05.1, §3.3).</summary>
+    public async Task EnsureCanConfigureAsync(ActorContext actor, CampaignRec campaign, CancellationToken ct)
     {
-        if (actor.IsAdmin)
-        {
-            return;
-        }
-
-        if (campaign.OwnerMasterId != actor.MasterId)
-        {
-            throw new MotivaException(ErrorCode.AuthzForbidden, "Only the current campaign owner or an administrator may change settings.");
-        }
+        await rights.EnsureOwnerOrAdminAsync(actor, campaign, ct);
     }
 
     internal async Task EnsurePublishableAsync(ActorContext actor, CampaignRec campaign, CancellationToken ct)

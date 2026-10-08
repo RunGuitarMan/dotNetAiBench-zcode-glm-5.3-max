@@ -59,9 +59,16 @@ public sealed class ChallengeTests(MotivaFunctionalFixture fixture)
         var sending = Task.Run(() => world.SendEventAsync("src", "E-1", 1101, setup.TaskId, 2));
         await Task.Delay(300);
         fixture.Host.Clock.SetUtcNow(At(4, 8, 1)); // after endsAt while the transaction is paused
+
+        // A REAL competing finalizer runs while the event holds the advisory lock: it must wait,
+        // then read the committed score with a fresh statement (§3.2 step 3, B33.2).
+        var finalizer = Task.Run(() => world.Resolve<FinalizeChallengeHandler>().HandleAsync(world.CompanyId, setup.ChallengeId!.Value, CancellationToken.None));
+        await Task.Delay(200);
+        Assert.False(finalizer.IsCompleted); // blocked on the advisory lock held by the event
         fixture.Host.Impediments.Release(Checkpoints.ProgressBeforeCommit);
         var result = await sending;
         Assert.Equal("Accepted", TestWorld.ParseJson(result.Body).GetProperty("result").GetString());
+        Assert.True(await finalizer);
 
         var leaderboard = await world.Resolve<LeaderboardService>().GetPageAsync(world.Employee(1101), setup.ChallengeId!.Value, 10, CancellationToken.None);
         Assert.Equal(2, leaderboard.Items.Single().Score); // B33.2: counted despite the delayed response

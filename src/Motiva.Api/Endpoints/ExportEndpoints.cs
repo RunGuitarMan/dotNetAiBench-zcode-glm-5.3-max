@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Motiva.Api.Infrastructure;
 using Motiva.Application.Common;
 using Motiva.Application.Dto;
 using Motiva.Application.Exports;
@@ -17,8 +18,9 @@ internal static class ExportEndpoints
             [FromHeader(Name = "Idempotency-Key")] string? idempotencyKey,
             [FromBody] ExportCreateRequest body, CancellationToken ct) =>
             (await service.CreateAsync(
-                http.Actor(), Enum.Parse<ExportScope>(body.Scope), body.MasterId, body.ResourceId,
-                body.FromUtc, body.ToUtc, idempotencyKey, ct)).ToResult());
+                http.Actor(), EndpointHelpers.ParseEnum<ExportScope>(body.Scope, "scope"), body.MasterId, body.ResourceId,
+                StrictDates.ParseRequiredUtc(body.FromUtc, "fromUtc"),
+                StrictDates.ParseRequiredUtc(body.ToUtc, "toUtc"), idempotencyKey, ct)).ToResult());
         exports.MapGet("/", async (
             [FromServices] ExportsService service, HttpContext http,
             [FromQuery] int? limit, [FromQuery] string? cursor, CancellationToken ct) =>
@@ -39,5 +41,5 @@ internal static class ExportEndpoints
     }
 
     public sealed record ExportCreateRequest(
-        string Scope, int? MasterId, Guid? ResourceId, DateTimeOffset FromUtc, DateTimeOffset ToUtc);
+        string Scope, int? MasterId, Guid? ResourceId, string FromUtc, string ToUtc);
 }

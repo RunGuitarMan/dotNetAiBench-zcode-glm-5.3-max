@@ -8,6 +8,7 @@ namespace Motiva.Application.Administration;
 /// Award → campaign + resource from the campaign set; Spend → resource + purchase system.
 /// Revocation acts for new requests immediately, including replays (B05.1).</summary>
 public sealed class IntegrationGrantsService(
+    CurrentRights rights,
     IIntegrationDirectory grants,
     ICampaignCatalog campaigns,
     IResourceDirectory resources,
@@ -17,6 +18,8 @@ public sealed class IntegrationGrantsService(
     IdempotencyGate gate,
     TimeProvider timeProvider)
 {
+    private const string locationPrefix = "/api/v1/integration-grants/";
+
     public async Task<CommandResponse> CreateAsync(
         ActorContext actor,
         string subject,
@@ -27,7 +30,7 @@ public sealed class IntegrationGrantsService(
         string? idempotencyKey,
         CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         if (string.IsNullOrWhiteSpace(subject) || subject.Length > 100)
         {
             throw new MotivaException(ErrorCode.ValidationFailed, "subject must be 1..100 characters.");
@@ -40,7 +43,7 @@ public sealed class IntegrationGrantsService(
         var echo = await gate.BeginOrEchoAsync(actor.CompanyId, actor, "grant.create", "-", idempotencyKey, essential, ct);
         if (echo is not null)
         {
-            return new CommandResponse(echo.Status, echo.Body);
+            return new CommandResponse(echo.Status, echo.Body, echo.Location is not null ? locationPrefix + echo.Location : null);
         }
 
         var id = Guid.NewGuid();
@@ -65,7 +68,7 @@ public sealed class IntegrationGrantsService(
 
     public async Task<CommandResponse> RevokeAsync(ActorContext actor, Guid id, string? ifMatch, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         var version = ETags.ParseRequired(ifMatch);
         var now = timeProvider.GetUtcNow();
         await using var scope = await uow.BeginAsync(ct);
@@ -91,14 +94,14 @@ public sealed class IntegrationGrantsService(
 
     public async Task<IntegrationGrantRec> GetAsync(ActorContext actor, Guid id, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         return await grants.GetAsync(actor.CompanyId, id, ct) ?? throw new MotivaException(ErrorCode.NotFound);
     }
 
-    public Task<Page<IntegrationGrantRec>> ListAsync(ActorContext actor, string? subject, int limit, string? cursor, CancellationToken ct)
+    public async Task<Page<IntegrationGrantRec>> ListAsync(ActorContext actor, string? subject, int limit, string? cursor, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
-        return grants.ListAsync(actor.CompanyId, subject, limit, cursor, ct);
+        await rights.EnsureAdminAsync(actor, ct);
+        return await grants.ListAsync(actor.CompanyId, subject, limit, cursor, ct);
     }
 
     private async Task<string> ValidateTarget(

@@ -12,20 +12,42 @@ public sealed class ProblemDetailsMiddleware(RequestDelegate next, ILogger<Probl
 {
     public async Task InvokeAsync(HttpContext context)
     {
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             await next(context);
-            if (context.Response.StatusCode == 401 && !context.Response.HasStarted && context.Response.ContentLength is null)
+            // Framework-produced empty error responses (model binding, auth) become Problem
+            // Details with a constant code and traceId — the contract never returns bare 4xx (T04).
+            Motiva.Infrastructure.MotivaMetrics.ObserveRequest(
+                context.Request.Method == "GET" || context.Request.Method == "HEAD" ? "read" : "write",
+                stopwatch.Elapsed.TotalMilliseconds);
+            if (context.Response.StatusCode >= 400)
             {
-                await WriteAsync(context, 401, "auth.invalid-token", "The access token is missing or invalid.");
+                Motiva.Infrastructure.MotivaMetrics.Count("http:status:" + context.Response.StatusCode);
             }
-            else if (context.Response.StatusCode == 403 && !context.Response.HasStarted && context.Response.ContentLength is null)
+
+            if (context.Response.StatusCode >= 400 && !context.Response.HasStarted && context.Response.ContentLength is null)
             {
-                await WriteAsync(context, 403, "authz.forbidden", "Insufficient permissions for the operation.");
+                var (status, code, title) = context.Response.StatusCode switch
+                {
+                    400 => (400, "validation.failed", "The request payload is malformed."),
+                    401 => (401, "auth.invalid-token", "The access token is missing or invalid."),
+                    403 => (403, "authz.forbidden", "Insufficient permissions for the operation."),
+                    404 => (404, "not-found", "Object not found."),
+                    409 => (409, "conflict.state", "The operation conflicts with the current state."),
+                    415 => (415, "validation.failed", "Unsupported content type."),
+                    _ => (context.Response.StatusCode, "validation.failed", "The request was rejected."),
+                };
+                await WriteAsync(context, status, code, title);
             }
         }
         catch (MotivaException ex)
         {
+            Motiva.Infrastructure.MotivaMetrics.ObserveRequest(
+                context.Request.Method == "GET" || context.Request.Method == "HEAD" ? "read" : "write",
+                stopwatch.Elapsed.TotalMilliseconds);
+            Motiva.Infrastructure.MotivaMetrics.Count("http:status:" + MotivaException.HttpStatusOf(ex.Code));
+            Motiva.Infrastructure.MotivaMetrics.Count("errors:business:" + MotivaException.StringCodeOf(ex.Code));
             var status = MotivaException.HttpStatusOf(ex.Code);
             if (status == 503)
             {
@@ -37,6 +59,15 @@ public sealed class ProblemDetailsMiddleware(RequestDelegate next, ILogger<Probl
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
             throw;
+        }
+        catch (BadHttpRequestException ex) when (ex.StatusCode == 400)
+        {
+            // Malformed JSON or query binding: contract 400 with code/traceId, not an empty body (T04).
+            await WriteAsync(context, 400, "validation.failed", "The request payload is malformed.");
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            await WriteAsync(context, 400, "validation.failed", "The request payload is not valid JSON.");
         }
         catch (Exception ex) when (IsDatabaseUnavailable(ex))
         {

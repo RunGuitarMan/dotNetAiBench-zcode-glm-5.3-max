@@ -26,6 +26,9 @@ public sealed class OutboxDispatcherService(
                 using var scope = services.CreateScope();
                 var runner = scope.ServiceProvider.GetRequiredService<BackgroundJobRunner>();
                 await runner.RunOnceAsync(workerId, stoppingToken);
+                var jobs = scope.ServiceProvider.GetRequiredService<Motiva.Application.Ports.IBackgroundJobs>();
+                Motiva.Infrastructure.MotivaMetrics.SetGauge("outbox:pending", await jobs.CountPendingAsync(stoppingToken));
+                Motiva.Infrastructure.MotivaMetrics.Count("outbox:cycles");
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {

@@ -53,7 +53,7 @@ public static class DtoMapper
         => new(rec.ResourceId, rec.ResourceCode, rec.AllocatedTotal, rec.SpentTotal, rec.ReturnedTotal, rec.Available);
 
     public static ActorDto ToDto(ActorContext actor)
-        => new(actor.ActorType.ToString(), actor.MasterId, actor.MasterId is null ? actor.Subject : null);
+        => new(actor.ActorType == ActorType.User ? "user" : "service", actor.MasterId, actor.MasterId is null ? actor.Subject : null);
 
     public static OperationItemDto ToDto(OperationItemRec rec)
         => new(rec.ResourceId, rec.ResourceCode, rec.Amount, rec.IsDebit ? "debit" : "credit");

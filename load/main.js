@@ -3,7 +3,7 @@
 // 5% new spends (1 unit). Routes follow docs/openapi.yaml.
 import http from 'k6/http';
 import { check, sleep } from 'k6';
-import { Counter } from 'k6/metrics';
+import { Counter, Trend } from 'k6/metrics';
 
 const BASE = __ENV.BASE_URL || 'http://lb';
 const EMP = __ENV.EMP_TOKEN;
@@ -16,7 +16,16 @@ const RESOURCE_ID = __ENV.RESOURCE_ID;
 const EMPLOYEES = Number(__ENV.EMPLOYEE_MAX || 10002);
 
 const failed = new Counter('motiva_failed_requests');
+const businessWrong = new Counter('motiva_business_wrong');
 const CHALLENGES = (__ENV.CHALLENGE_IDS || '').split(',').filter(Boolean);
+const START_MS = Date.now();
+
+// The measurement window starts after the 60 s warmup stage; every request is tagged so the
+// summary separates warmup from measurement (T09: 60 s прогрев + 300 с измерение).
+function tags(kind) {
+  const measurement = Date.now() - START_MS >= 60000;
+  return { kind: kind, phase: measurement ? 'measure' : 'warmup' };
+}
 
 export const options = {
   scenarios: {
@@ -34,26 +43,35 @@ export const options = {
     },
   },
   thresholds: {
-    http_req_failed: ['rate<0.005'],
-    'http_req_duration{kind:read}': ['p(95)<200', 'p(99)<1000'],
-    'http_req_duration{kind:write}': ['p(95)<500', 'p(99)<1000'],
+    'http_req_failed{phase:measure}': ['rate<0.005'],
+    'http_req_duration{kind:read,phase:measure}': ['p(95)<200', 'p(99)<1000'],
+    'http_req_duration{kind:write,phase:measure}': ['p(95)<500', 'p(99)<1000'],
   },
 };
 
 const headersFor = (token) => ({ Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' });
 
+export default function () { mix(); }
+
 export function mix() {
   const dice = Math.random();
   if (dice < 0.50) {
     // catalog: employee-visible resources (Valkey 30 s snapshot or PG fallback)
-    const r = http.get(BASE + '/api/v1/resources', { headers: headersFor(EMP), tags: { kind: 'read' } });
+    const r = http.get(BASE + '/api/v1/resources', { headers: headersFor(EMP), tags: tags('read') });
     check(r, { 'catalog 200': (res) => res.status === 200 }) || failed.add(1);
   } else if (dice < 0.75) {
-    const r = http.get(BASE + '/api/v1/me/wallet', { headers: headersFor(EMP), tags: { kind: 'read' } });
+    const r = http.get(BASE + '/api/v1/me/wallet', { headers: headersFor(EMP), tags: tags('read') });
     check(r, { 'wallet 200': (res) => res.status === 200 }) || failed.add(1);
   } else if (dice < 0.85) {
-    const challenge = CHALLENGES[Math.floor(Math.random() * CHALLENGES.length)][Math.floor(Math.random() * CHALLENGES.length)];
-    const r = http.get(BASE + '/api/v1/challenges/' + challenge + '/leaderboard?limit=10', { headers: headersFor(EMP), tags: { kind: 'read' } });
+    if (CHALLENGES.length === 0) {
+      // Fail loudly rather than silently dropping the 10% branch (adapter verification, D15).
+      businessWrong.add(1);
+      failed.add(1);
+      sleep(0.05);
+      return;
+    }
+    const challenge = CHALLENGES[Math.floor(Math.random() * CHALLENGES.length)];
+    const r = http.get(BASE + '/api/v1/challenges/' + challenge + '/leaderboard?limit=10', { headers: headersFor(EMP), tags: tags('read') });
     check(r, { 'leaderboard 200': (res) => res.status === 200 }) || failed.add(1);
   } else if (dice < 0.95) {
     const task = TASKS[Math.floor(Math.random() * TASKS.length)];
@@ -64,8 +82,12 @@ export function mix() {
       taskId: task,
       delta: 1,
     });
-    const r = http.post(BASE + '/api/v1/progress-events', body, { headers: headersFor(SRC), tags: { kind: 'write' } });
-    check(r, { 'event 201': (res) => res.status === 201 }) || failed.add(1);
+    const r = http.post(BASE + '/api/v1/progress-events', body, { headers: headersFor(SRC), tags: tags('write') });
+    // 201 is the transport result; the business result must be Accepted for the seeded audience.
+    check(r, {
+      'event 201': (res) => res.status === 201,
+      'event Accepted': (res) => res.status === 201 && JSON.parse(res.body).result === 'Accepted',
+    }) || (failed.add(1), businessWrong.add(1));
   } else {
     const viaShop = Math.random() < 0.5;
     const body = {
@@ -80,8 +102,12 @@ export function mix() {
     }
 
     const token = viaShop ? SHOP : EMP;
-    const r = http.post(BASE + '/api/v1/spends', JSON.stringify(body), { headers: headersFor(token), tags: { kind: 'write' } });
-    check(r, { 'spend 201': (res) => res.status === 201 }) || failed.add(1);
+    const r = http.post(BASE + '/api/v1/spends', JSON.stringify(body), { headers: headersFor(token), tags: tags('write') });
+    // The seeded wallets are topped up for 1-unit spends: the business result must be Posted.
+    check(r, {
+      'spend 201': (res) => res.status === 201,
+      'spend Posted': (res) => res.status === 201 && JSON.parse(res.body).result === 'Posted',
+    }) || (failed.add(1), businessWrong.add(1));
   }
   sleep(0.05);
 }

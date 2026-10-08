@@ -73,8 +73,10 @@ public sealed class EconomyRightsTests(MotivaFunctionalFixture fixture)
         await employees.PatchAsync(world.Admin, 700, ETags.Format(profile.Version), isActive: false, tags: null, CancellationToken.None);
 
         await Assert.ThrowsAsync<MotivaException>(() => spends.SpendAsync(world.Employee(700), null, system, a, 1, "B1", CancellationToken.None));
-        var history = await world.Resolve<ReadService>().ListOwnOperationsAsync(world.Employee(700), 100, null, null, null, null, null, null, CancellationToken.None);
+        var history = await world.Resolve<ReadService>().ListEmployeeOperationsAsync(world.Admin, 700, 100, null, null, null, null, null, CancellationToken.None);
         Assert.DoesNotContain(history.Items, o => o.SourceOperationNumber == "B1");
+        await Assert.ThrowsAsync<MotivaException>(
+            () => world.Resolve<ReadService>().ListOwnOperationsAsync(world.Employee(700), 100, null, null, null, null, null, null, CancellationToken.None));
 
         // A NEW service spend to the blocked recipient: saved decline, number occupied.
         var declined = await spends.SpendAsync(world.Service("shop-source"), 700, system, a, 1, "B2", CancellationToken.None);
@@ -154,6 +156,8 @@ public sealed class EconomyRightsTests(MotivaFunctionalFixture fixture)
 
         // Wallet holds 15 A (10 reward + manual 5); archive A; reversal returns 10 to the budget.
         await world.Resolve<ManualAwardsService>().AwardAsync(world.Admin, setup.CampaignId, 810, a, 5, "extra", "MA-1", CancellationToken.None);
+        var system = await world.CreatePurchaseSystemAsync("SHOP", a);
+        await world.CreateGrantAsync("shop", "Spend", resourceId: a, purchaseSystemId: system);
         var resources = world.Resolve<ResourcesService>();
         var current = await resources.GetAsync(world.Admin, a, CancellationToken.None);
         await resources.PatchAsync(world.Admin, a, ETags.Format(current.Version), null, ResourceStatus.Archived, CancellationToken.None);
@@ -163,9 +167,8 @@ public sealed class EconomyRightsTests(MotivaFunctionalFixture fixture)
         Assert.Equal(5, (await world.WalletAsync(810))["A"]);
         Assert.Equal(45, await world.BudgetAvailableAsync(setup.CampaignId, a));
 
-        // New spending of the archived resource is forbidden (B07.2).
-        var system = await world.CreatePurchaseSystemAsync("SHOP", a);
-        await world.CreateGrantAsync("shop", "Spend", resourceId: a, purchaseSystemId: system);
+        // New spending of the archived resource is forbidden (B07.2): the system was configured
+        // BEFORE archiving, so the decline is the economic ResourceUnavailable answer.
         var spend = await world.Resolve<SpendsService>().SpendAsync(world.Employee(810), null, system, a, 1, "S-1", CancellationToken.None);
         Assert.Equal("ResourceUnavailable", TestWorld.ParseJson(spend.Body).GetProperty("refusalCode").GetString());
     }
@@ -192,7 +195,7 @@ public sealed class EconomyRightsTests(MotivaFunctionalFixture fixture)
         var reads = world.Resolve<ReadService>();
         var blockedWallet = await reads.GetEmployeeWalletAsync(world.Admin, 900, CancellationToken.None);
         Assert.Equal(3, blockedWallet.Balances.Single(b => b.ResourceCode == "A").Balance);
-        var events = await world.Resolve<ProgressEventsService>().ListOwnAsync(world.Employee(900), 100, null, null, null, null, null, CancellationToken.None);
+        var events = await world.Resolve<ProgressEventsService>().ListCompanyAsync(world.Admin, 100, null, null, null, CancellationToken.None);
         Assert.Single(events.Items);
 
         // Administrative correction of the blocked recipient's award is allowed (H0 Q03); owner only — 403.
@@ -212,7 +215,7 @@ public sealed class EconomyRightsTests(MotivaFunctionalFixture fixture)
         var grant = grantList.Items.Single(g => g.Kind == GrantKind.Progress);
         await grants.RevokeAsync(world.Admin, grant.Id, ETags.Format(grant.Version), CancellationToken.None);
         await Assert.ThrowsAsync<MotivaException>(() => world.SendEventAsync("src", "E-3", 900, setup.TaskId, 1));
-        var keptEvents = await world.Resolve<ProgressEventsService>().ListOwnAsync(world.Employee(900), 100, null, null, null, null, null, CancellationToken.None);
+        var keptEvents = await world.Resolve<ProgressEventsService>().ListCompanyAsync(world.Admin, 100, null, null, null, CancellationToken.None);
         Assert.Single(keptEvents.Items);
     }
 

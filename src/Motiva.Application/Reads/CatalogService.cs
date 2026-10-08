@@ -65,48 +65,59 @@ public sealed class CatalogService(
         return (items, timeProvider.GetUtcNow());
     }
 
-    public async Task<(IReadOnlyList<ResourceDto> Items, DateTimeOffset AsOfUtc)> ListResourcesAsync(
+    public async Task<(IReadOnlyList<ResourceDto> Items, string? NextCursor)> ListResourcesAsync(
         ActorContext actor, ResourceStatus? status, int limit, string? cursor, CancellationToken ct)
     {
-        var asOf = timeProvider.GetUtcNow();
-        var key = "catalog:resources:" + actor.CompanyId + ":" + (status?.ToString() ?? "all");
-        var cached = await cache.GetAsync(key, ct);
-        if (cached is not null && CanonicalJson.Deserialize<CatalogPage<ResourceDto>>(cached) is { } page && page.AsOfUtc >= asOf - TimeSpan.FromSeconds(30))
-        {
-            return (page.Items.Skip(OffsetOf(cursor)).Take(limit).ToArray(), page.AsOfUtc);
-        }
-
-        var fetched = await resources.ListAsync(actor.CompanyId, status, 100, null, ct);
-        var dto = fetched.Items.Select(DtoMapper.ToDto).ToArray();
-        var payload = new CatalogPage<ResourceDto>(dto, asOf);
-        await cache.SetAsync(key, CanonicalJson.Serialize(payload), asOf, TimeSpan.FromSeconds(30), ct);
-        return (dto.Skip(OffsetOf(cursor)).Take(limit).ToArray(), asOf);
+        var (page, asOf) = await GetCatalogPageAsync(
+            actor, "catalog:resources:" + actor.CompanyId + ":" + (status?.ToString() ?? "all"),
+            () => resources.ListAsync(actor.CompanyId, status, MaxCatalog, null, ct),
+            r => DtoMapper.ToDto(r), ct);
+        return Slice(page, limit, cursor, asOf);
     }
 
-    public async Task<(IReadOnlyList<AchievementDto> Items, DateTimeOffset AsOfUtc)> ListAchievementsAsync(
+    public async Task<(IReadOnlyList<AchievementDto> Items, string? NextCursor)> ListAchievementsAsync(
         ActorContext actor, int limit, string? cursor, CancellationToken ct)
     {
-        var asOf = timeProvider.GetUtcNow();
-        var key = "catalog:achievements:" + actor.CompanyId;
-        var cached = await cache.GetAsync(key, ct);
-        if (cached is not null && CanonicalJson.Deserialize<CatalogPage<AchievementDto>>(cached) is { } page && page.AsOfUtc >= asOf - TimeSpan.FromSeconds(30))
-        {
-            return (page.Items.Skip(OffsetOf(cursor)).Take(limit).ToArray(), page.AsOfUtc);
-        }
-
-        var fetched = await achievements.ListAsync(actor.CompanyId, 100, null, ct);
-        var dto = fetched.Items.Select(DtoMapper.ToDto).ToArray();
-        var payload = new CatalogPage<AchievementDto>(dto, asOf);
-        await cache.SetAsync(key, CanonicalJson.Serialize(payload), asOf, TimeSpan.FromSeconds(30), ct);
-        return (dto.Skip(OffsetOf(cursor)).Take(limit).ToArray(), asOf);
+        var (page, asOf) = await GetCatalogPageAsync(
+            actor, "catalog:achievements:" + actor.CompanyId,
+            () => achievements.ListAsync(actor.CompanyId, MaxCatalog, null, ct),
+            a => DtoMapper.ToDto(a), ct);
+        return Slice(page, limit, cursor, asOf);
     }
 
-    private static int OffsetOf(string? cursor)
-    {
-        return CursorCodec.Decode<OffsetCursor>(cursor)?.Offset ?? 0;
-    }
+    private const int MaxCatalog = 100;
 
     private sealed record OffsetCursor(int Offset);
 
     private sealed record CatalogPage<T>(IReadOnlyList<T> Items, DateTimeOffset AsOfUtc);
+
+    private async Task<(CatalogPage<TDto> Page, DateTimeOffset AsOf)> GetCatalogPageAsync<TRec, TDto>(
+        ActorContext actor, string key, Func<Task<Page<TRec>>> fetch, Func<TRec, TDto> map, CancellationToken ct)
+        where TRec : notnull
+    {
+        var asOf = timeProvider.GetUtcNow();
+        var cached = await cache.GetAsync(key, ct);
+        if (cached is not null && CanonicalJson.Deserialize<CatalogPage<TDto>>(cached) is { } cachedPage
+            && cachedPage.AsOfUtc >= asOf - TimeSpan.FromSeconds(30))
+        {
+            return (cachedPage, cachedPage.AsOfUtc);
+        }
+
+        var fetched = await fetch();
+        var page = new CatalogPage<TDto>(fetched.Items.Select(map).ToArray(), asOf);
+        await cache.SetAsync(key, CanonicalJson.Serialize(page), asOf, TimeSpan.FromSeconds(30), ct);
+        return (page, asOf);
+    }
+
+    /// <summary>Offset slicing with an honest nextCursor: present only when more items exist (T04).</summary>
+    private static (IReadOnlyList<TDto> Items, string? NextCursor) Slice<TDto>(
+        CatalogPage<TDto> page, int limit, string? cursor, DateTimeOffset asOf)
+    {
+        var offset = CursorCodec.Decode<OffsetCursor>(cursor)?.Offset ?? 0;
+        var items = page.Items.Skip(offset).Take(limit + 1).ToList();
+        var hasMore = items.Count > limit;
+        var result = items.Take(limit).ToArray();
+        var next = hasMore ? CursorCodec.Encode(new OffsetCursor(offset + limit)) : null;
+        return (result, next);
+    }
 }

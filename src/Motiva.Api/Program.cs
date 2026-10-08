@@ -30,12 +30,12 @@ ReadingEndpoints.Map(api);
 ExportEndpoints.Map(api);
 
 app.MapGet("/health/live", () => Results.Ok(new { status = "alive" }));
-app.MapGet("/health/ready", async (Motiva.Infrastructure.Persistence.MotivaDbContext db) =>
+app.MapGet("/health/ready", async (Motiva.Infrastructure.HealthChecks health) =>
 {
-    var canConnect = await db.Database.CanConnectAsync();
-    return canConnect ? Results.Ok(new { status = "ready" }) : Results.Json(new { status = "degraded" }, statusCode: 503);
+    var ready = await health.DatabaseReachableAsync();
+    return ready ? Results.Ok(new { status = "ready" }) : Results.Json(new { status = "degraded" }, statusCode: 503);
 });
-app.MapGet("/metrics", () => Results.Text(MotivaMetrics.RenderText(), "text/plain; version=0.0.4"));
+app.MapGet("/metrics", () => Results.Text(Motiva.Infrastructure.MotivaMetrics.RenderText(), "text/plain; version=0.0.4"));
 
 app.Run();
 

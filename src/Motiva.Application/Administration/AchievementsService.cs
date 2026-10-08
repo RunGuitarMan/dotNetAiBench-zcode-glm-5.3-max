@@ -7,16 +7,19 @@ namespace Motiva.Application.Administration;
 /// <summary>Achievement definitions (B29.5, B30.1): created by the administrator; the code is
 /// unique in the company ignoring case and immutable; archiving is not provided by the source.</summary>
 public sealed class AchievementsService(
+    CurrentRights rights,
     IAchievementDirectory achievements,
     IAuditLog audit,
     IUnitOfWork uow,
     IdempotencyGate gate,
     TimeProvider timeProvider)
 {
+    private const string locationPrefix = "/api/v1/achievements/";
+
     public async Task<CommandResponse> CreateAsync(
         ActorContext actor, string? rawCode, string name, string? description, string? idempotencyKey, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         var code = Guard.Code(rawCode);
         Guard.Name(name);
         Guard.Description(description);
@@ -26,7 +29,7 @@ public sealed class AchievementsService(
         var echo = await gate.BeginOrEchoAsync(actor.CompanyId, actor, "achievement.create", "-", idempotencyKey, essential, ct);
         if (echo is not null)
         {
-            return new CommandResponse(echo.Status, echo.Body);
+            return new CommandResponse(echo.Status, echo.Body, echo.Location is not null ? locationPrefix + echo.Location : null);
         }
 
         var id = Guid.NewGuid();
@@ -48,7 +51,7 @@ public sealed class AchievementsService(
     public async Task<CommandResponse> PatchAsync(
         ActorContext actor, Guid id, string? ifMatch, string? name, string? description, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         var version = ETags.ParseRequired(ifMatch);
         if (name is not null)
         {
@@ -94,6 +97,9 @@ public sealed class AchievementsService(
     public async Task<AchievementRec> GetAsync(ActorContext actor, Guid id, CancellationToken ct)
         => await achievements.GetAsync(actor.CompanyId, id, ct) ?? throw new MotivaException(ErrorCode.NotFound);
 
-    public Task<Page<AchievementRec>> ListAsync(ActorContext actor, int limit, string? cursor, CancellationToken ct)
-        => achievements.ListAsync(actor.CompanyId, limit, cursor, ct);
+    public async Task<Page<AchievementRec>> ListAsync(ActorContext actor, int limit, string? cursor, CancellationToken ct)
+    {
+        await rights.EnsureActiveEmployeeAsync(actor, ct);
+        return await achievements.ListAsync(actor.CompanyId, limit, cursor, ct);
+    }
 }

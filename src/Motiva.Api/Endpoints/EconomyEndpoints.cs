@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Motiva.Api.Infrastructure;
 using Motiva.Application.Budgets;
 using Motiva.Application.Common;
 using Motiva.Application.Dto;
@@ -54,9 +55,9 @@ internal static class EconomyEndpoints
         api.MapGet("/progress-events", async (
             [FromServices] ProgressEventsService service, HttpContext http,
             [FromQuery] int? limit, [FromQuery] string? cursor,
-            [FromQuery] DateTimeOffset? from, [FromQuery] DateTimeOffset? to, CancellationToken ct) =>
+            [FromQuery] string? from, [FromQuery] string? to, CancellationToken ct) =>
         {
-            var page = await service.ListCompanyAsync(http.Actor(), Paging.NormalizeLimit(limit), cursor, from, to, ct);
+            var page = await service.ListCompanyAsync(http.Actor(), Paging.NormalizeLimit(limit), cursor, StrictDates.ParseOptionalUtc(from, "from"), StrictDates.ParseOptionalUtc(to, "to"), ct);
             return EndpointHelpers.Page(page, MapProgressEvent);
         });
     }

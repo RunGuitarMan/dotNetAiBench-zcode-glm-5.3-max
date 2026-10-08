@@ -19,6 +19,13 @@ public sealed class CleanupHandler(
         {
             try
             {
+                // A worker may still hold a formation lease: deleting under it races with a
+                // late upload. Wait for the lease to expire so the deletion is final (§3.6).
+                if (await exports.HasLiveLeaseAsync(exportId, timeProvider.GetUtcNow(), ct))
+                {
+                    continue;
+                }
+
                 await storage.DeletePrefixAsync("exports/" + exportId.ToString() + "/", ct);
                 await exports.ClearCleanupIntentAsync(exportId, ct);
             }

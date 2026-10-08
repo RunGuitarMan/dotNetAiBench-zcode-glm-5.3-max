@@ -72,6 +72,7 @@ public sealed class CampaignStore(MotivaDbContext db) : ICampaignCatalog
         Guid companyId, Guid campaignId, int expectedVersion, string? name, string? description, AudienceRule? audience,
         CampaignStatus? status, CancellationToken ct)
     {
+        await LockCampaignRowAsync(campaignId, ct);
         var row = await db.Campaigns.Include(c => c.Tags).FirstOrDefaultAsync(c => c.CompanyId == companyId && c.Id == campaignId, ct);
         if (row is null || row.Status == "Deleted")
         {
@@ -120,6 +121,7 @@ public sealed class CampaignStore(MotivaDbContext db) : ICampaignCatalog
 
     public async Task<UpdateOutcome> DeleteDraftAsync(Guid companyId, Guid campaignId, int expectedVersion, CancellationToken ct)
     {
+        await LockCampaignRowAsync(campaignId, ct);
         var row = await db.Campaigns.FirstOrDefaultAsync(c => c.CompanyId == companyId && c.Id == campaignId, ct);
         if (row is null || row.Status == "Deleted")
         {
@@ -149,6 +151,7 @@ public sealed class CampaignStore(MotivaDbContext db) : ICampaignCatalog
     public async Task<(UpdateOutcome, CampaignRec?)> PutOwnerAsync(
         Guid companyId, Guid campaignId, int expectedVersion, int ownerMasterId, CancellationToken ct)
     {
+        await LockCampaignRowAsync(campaignId, ct);
         var row = await LoadAsync(companyId, campaignId, ct);
         if (row is null)
         {
@@ -179,6 +182,7 @@ public sealed class CampaignStore(MotivaDbContext db) : ICampaignCatalog
     public async Task<(UpdateOutcome, IReadOnlyList<CampaignResourceRec>?)> PutResourcesAsync(
         Guid companyId, Guid campaignId, int expectedVersion, IReadOnlyList<Guid> resourceIds, CancellationToken ct)
     {
+        await LockCampaignRowAsync(campaignId, ct);
         var row = await LoadAsync(companyId, campaignId, ct);
         if (row is null)
         {
@@ -270,6 +274,11 @@ public sealed class CampaignStore(MotivaDbContext db) : ICampaignCatalog
         if (row.Version != expectedVersion)
         {
             return (UpdateOutcome.VersionMismatch, null);
+        }
+
+        if (row.Status == "Archived")
+        {
+            return (UpdateOutcome.InvalidTransition, null);
         }
 
         if (name is not null)
@@ -364,6 +373,11 @@ public sealed class CampaignStore(MotivaDbContext db) : ICampaignCatalog
         if (row.Version != expectedVersion)
         {
             return (UpdateOutcome.VersionMismatch, null);
+        }
+
+        if (row.Status == "Archived")
+        {
+            return (UpdateOutcome.InvalidTransition, null);
         }
 
         if (name is not null)
@@ -594,6 +608,15 @@ public sealed class CampaignStore(MotivaDbContext db) : ICampaignCatalog
     {
         return await db.Campaigns.Include(c => c.Tags)
             .FirstOrDefaultAsync(c => c.CompanyId == companyId && c.Id == campaignId, ct);
+    }
+
+    private async Task LockCampaignRowAsync(Guid campaignId, CancellationToken ct)
+    {
+        // The aggregate version (ETag source) must change atomically: all writers take the
+        // campaign row lock before comparing versions (§4.4, T06).
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"SELECT id FROM campaigns WHERE id = {campaignId} FOR UPDATE", ct);
+        db.ChangeTracker.Clear();
     }
 
     private async Task<TaskRow?> LoadTaskAsync(Guid companyId, Guid taskId, CancellationToken ct)

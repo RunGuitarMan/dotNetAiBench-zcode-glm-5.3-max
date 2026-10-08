@@ -4,5 +4,6 @@
     <ProjectReference Include="..\Motiva.Infrastructure\Motiva.Infrastructure.csproj" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
     <PackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" PrivateAssets="all" />
+    <AdditionalFiles Include="BannedSymbols.txt" />
   </ItemGroup>
 </Project>

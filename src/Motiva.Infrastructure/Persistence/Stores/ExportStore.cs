@@ -8,7 +8,7 @@ namespace Motiva.Infrastructure.Persistence.Stores;
 /// <summary>Export persistence (§3.6): the snapshot materializes in one REPEATABLE READ
 /// transaction that atomically moves Pending/Error → Forming, bumps generation and freezes
 /// the operation id set; Ready/Error/lease transitions are guarded by generation CAS.</summary>
-public sealed class ExportStore(MotivaDbContext db) : IExportStore
+public sealed class ExportStore(MotivaDbContext db, TimeProvider timeProvider) : IExportStore
 {
     public async Task<(UpdateOutcome, ExportRec?)> CreateAsync(
         Guid companyId, Guid id, ActorContext requester, ExportScope scope, int? masterId, Guid? resourceId,
@@ -39,7 +39,9 @@ public sealed class ExportStore(MotivaDbContext db) : IExportStore
 
     public async Task<ExportRec?> LoadAsync(Guid exportId, CancellationToken ct)
     {
-        var row = await db.ExportRequests.FindAsync(new object[] { exportId }, ct);
+        // No tracking: a worker must observe the committed state (e.g. a concurrent delete),
+        // not a stale snapshot of its own earlier read (§3.6 race).
+        var row = await db.ExportRequests.AsNoTracking().FirstOrDefaultAsync(e => e.Id == exportId, ct);
         return row is null ? null : ToRec(row);
     }
 
@@ -79,7 +81,7 @@ public sealed class ExportStore(MotivaDbContext db) : IExportStore
             return new ExportSnapshotResult(false, 0, Array.Empty<Guid>());
         }
 
-        if (row.Status == "Forming" && row.LeaseUntil is { } until && until > DateTimeOffset.UtcNow)
+        if (row.Status == "Forming" && row.LeaseUntil is { } until && until > timeProvider.GetUtcNow())
         {
             // A live lease owns the formation; an expired one may be taken over (generation++).
             await transaction.RollbackAsync(ct);
@@ -125,7 +127,7 @@ public sealed class ExportStore(MotivaDbContext db) : IExportStore
         row.Status = "Forming";
         row.Generation = generation;
         row.LeaseOwner = leaseOwner;
-        row.LeaseUntil = DateTimeOffset.UtcNow.Add(leaseDuration);
+        row.LeaseUntil = timeProvider.GetUtcNow().Add(leaseDuration);
         row.ErrorDetail = null;
         await db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);
@@ -186,6 +188,14 @@ public sealed class ExportStore(MotivaDbContext db) : IExportStore
     public Task ClearCleanupIntentAsync(Guid exportId, CancellationToken ct)
         => db.ExportRequests.Where(e => e.Id == exportId)
             .ExecuteUpdateAsync(s => s.SetProperty(e => e.CleanupIntent, false), ct);
+
+    public async Task<bool> HasLiveLeaseAsync(Guid exportId, DateTimeOffset utcNow, CancellationToken ct)
+    {
+        var row = await db.ExportRequests.Where(e => e.Id == exportId)
+            .Select(e => new { e.Status, e.LeaseUntil })
+            .FirstOrDefaultAsync(ct);
+        return row is { Status: "Forming" } && row.LeaseUntil is { } until && until > utcNow;
+    }
 
     public Task<IReadOnlyList<Guid>> GetSnapshotOperationIdsAsync(Guid exportId, CancellationToken ct)
         => db.ExportOperationIds.Where(x => x.ExportId == exportId).Select(x => x.OperationId).ToListAsync(ct).ContinueWith(t => (IReadOnlyList<Guid>)t.Result);

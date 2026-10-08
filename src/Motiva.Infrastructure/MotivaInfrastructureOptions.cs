@@ -19,4 +19,8 @@ public sealed class MotivaInfrastructureOptions
     public string S3Bucket { get; set; } = "motiva-exports";
 
     public string S3Region { get; set; } = "us-east-1";
+
+    /// <summary>Public endpoint for presigned URLs (e.g. http://localhost:9100 when the API
+    /// talks to S3 through the compose network). Empty = reuse S3ServiceUrl.</summary>
+    public string S3PublicUrl { get; set; } = string.Empty;
 }

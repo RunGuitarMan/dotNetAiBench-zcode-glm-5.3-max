@@ -14,6 +14,7 @@ namespace Motiva.Application.Progress;
 /// canonical response (byte-identical replay).
 /// </summary>
 public sealed class ProgressEventsService(
+    CurrentRights rights,
     IEmployeeDirectory employees,
     ICampaignCatalog campaigns,
     ICompanyDirectory companies,
@@ -160,14 +161,14 @@ public sealed class ProgressEventsService(
     public async Task<Page<ProgressEventRec>> ListOwnAsync(
         ActorContext actor, int limit, string? cursor, DateTimeOffset? from, DateTimeOffset? toUtc, Guid? campaignId, Guid? taskId, CancellationToken ct)
     {
-        Authz.EnsureUser(actor);
+        await rights.EnsureActiveEmployeeAsync(actor, ct);
         return await progress.ListForEmployeeAsync(actor.CompanyId, actor.MasterId!.Value, limit, cursor, from, toUtc, campaignId, taskId, ct);
     }
 
     public async Task<Page<ProgressEventRec>> ListCompanyAsync(
         ActorContext actor, int limit, string? cursor, DateTimeOffset? from, DateTimeOffset? toUtc, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         return await progress.ListForCompanyAsync(actor.CompanyId, limit, cursor, from, toUtc, ct);
     }
 
@@ -209,12 +210,17 @@ public sealed class ProgressEventsService(
         var resourceIds = items.Select(i => i.ResourceId).ToArray();
         var resourcesById = (await resources.ListByIdsAsync(actor.CompanyId, resourceIds, ct))
             .ToDictionary(r => r.Id);
+        var attemptedItems = items
+            .Select(i => new OperationItemRec(i.ResourceId, resourcesById.TryGetValue(i.ResourceId, out var known) ? known.Code : "UNKNOWN", i.Amount, IsDebit: false))
+            .ToArray();
 
         // H0 Q02: in a non-empty package the unavailability of any of its resources takes
         // priority over insufficient budget; an unrelated archived resource does not matter.
         if (resourceIds.Any(id => !resourcesById.TryGetValue(id, out var r) || r.Status == ResourceStatus.Archived))
         {
-            return new RewardDecision(RewardOutcome.DeclinedResourceUnavailable, null, RewardOutcome.DeclinedResourceUnavailable);
+            var unavailable = await InsertRewardOperationAsync(actor, campaign, masterId, eventNumber, acceptedAt,
+                attemptedItems, OperationResult.Declined, RefusalCode.ResourceUnavailable, ct);
+            return new RewardDecision(RewardOutcome.DeclinedResourceUnavailable, unavailable.Id, RewardOutcome.DeclinedResourceUnavailable);
         }
 
         // §3.1 — lock all budgets by resource id, then wallet balances.
@@ -233,7 +239,11 @@ public sealed class ProgressEventsService(
             var budget = await budgets.GetAsync(actor.CompanyId, campaign.Id, item.ResourceId, ct);
             if (budget is null || budget.Available < item.Amount)
             {
-                return new RewardDecision(RewardOutcome.DeclinedInsufficientBudget, null, RewardOutcome.DeclinedInsufficientBudget);
+                // A well-formed economic decline is a saved TaskReward operation with the
+                // attempted positions, visible in the operation history (T04, stage-2 §2.1/§3.5).
+                var declined = await InsertRewardOperationAsync(actor, campaign, masterId, eventNumber, acceptedAt,
+                    attemptedItems, OperationResult.Declined, RefusalCode.InsufficientBudget, ct);
+                return new RewardDecision(RewardOutcome.DeclinedInsufficientBudget, declined.Id, RewardOutcome.DeclinedInsufficientBudget);
             }
         }
 
@@ -246,13 +256,22 @@ public sealed class ProgressEventsService(
             await wallets.ApplyDeltaAsync(actor.CompanyId, masterId, item.ResourceId, item.Amount, ct);
         }
 
+        var posted = await InsertRewardOperationAsync(actor, campaign, masterId, eventNumber, acceptedAt,
+            operationItems, OperationResult.Posted, null, ct);
+        return new RewardDecision(RewardOutcome.Granted, posted.Id, RewardOutcome.Granted);
+    }
+
+    private async Task<OperationRec> InsertRewardOperationAsync(
+        ActorContext actor, CampaignRec campaign, int masterId, string eventNumber, DateTimeOffset acceptedAt,
+        OperationItemRec[] operationItems, OperationResult result, RefusalCode? refusal, CancellationToken ct)
+    {
         var operation = new OperationRec(
-            Guid.NewGuid(), OperationKind.TaskReward, OperationResult.Posted, null, actor, masterId, campaign.Id,
+            Guid.NewGuid(), OperationKind.TaskReward, result, refusal, actor, masterId, campaign.Id,
             null, null, null, eventNumber, operationItems, acceptedAt, null, null, null);
         var body = CanonicalJson.Serialize(DtoMapper.ToDto(operation));
         operation = operation with { ResponseStatus = 201, ResponseBody = body };
         await operations.InsertAsync(operation, ct);
-        return new RewardDecision(RewardOutcome.Granted, operation.Id, RewardOutcome.Granted);
+        return operation;
     }
 
     private static ProgressEventResultDto BuildResult(

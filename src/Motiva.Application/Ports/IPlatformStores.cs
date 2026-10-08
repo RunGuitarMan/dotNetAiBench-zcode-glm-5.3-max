@@ -78,6 +78,10 @@ public interface IFileStorage
 
     /// <summary>Opens the stored bytes for verification (tests read the CSV back).</summary>
     Task<Stream> OpenReadAsync(string key, CancellationToken ct);
+
+    /// <summary>Streaming multipart upload: the parts enumerator holds at most one bounded
+    /// buffer; the full export never materializes in memory (T07).</summary>
+    Task PutPartsAsync(string key, IAsyncEnumerable<byte[]> parts, CancellationToken ct);
 }
 
 public sealed record ExportSnapshotResult(bool Started, int NewGeneration, IReadOnlyList<Guid> OperationIds);
@@ -124,6 +128,9 @@ public interface IExportStore
     Task<IReadOnlyList<Guid>> ListCleanupIntentsAsync(CancellationToken ct);
 
     Task ClearCleanupIntentAsync(Guid exportId, CancellationToken ct);
+
+    /// <summary>True while some worker still owns a formation lease of this export (§3.6).</summary>
+    Task<bool> HasLiveLeaseAsync(Guid exportId, DateTimeOffset utcNow, CancellationToken ct);
 
     Task<IReadOnlyList<Guid>> GetSnapshotOperationIdsAsync(Guid exportId, CancellationToken ct);
 

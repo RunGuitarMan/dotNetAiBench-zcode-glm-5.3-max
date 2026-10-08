@@ -45,16 +45,21 @@ note "wait for the stand"
 await "$LB/health/ready" 200 60 || { fail "stand not ready"; exit 1; }
 pass "stand ready (2 API + 2 workers + PG + Valkey + S3)"
 
+# Per-run identities keep the script re-runnable against a stand with history.
+E2E_TS=$(date +%s)
+EMP_A=$((77000 + E2E_TS % 1000))
+EMP_B=$((78000 + E2E_TS % 1000))
+
 # ---------------------------------------------------------------- replay across API restarts
-api POST /api/v1/employees "$TOK_ADMIN" '{"masterId":123}' "Idempotency-Key: e2e-123-init" >/dev/null
+api POST /api/v1/employees "$TOK_ADMIN" "{\"masterId\":$EMP_A}" "Idempotency-Key: e2e-777-$E2E_TS" >/dev/null
 note "T3-20: replay after API restart returns the stored result"
 api POST /api/v1/employees "$TOK_ADMIN" '{"masterId":777}' "Idempotency-Key: e2e-777" >/dev/null
 RES_A=$(curl -s -D- -o /dev/null -X POST "$LB/api/v1/resources" -H "Authorization: Bearer $TOK_ADMIN" -H "Idempotency-Key: e2e-res-a" -H "Content-Type: application/json" -d '{"code":"E2EA","name":"a"}' | grep -i '^etag' | tr -d '\r')
-BODY_A=$(api POST /api/v1/employees "$TOK_ADMIN" '{"masterId":778}' "Idempotency-Key: e2e-778")
-docker compose restart api-1 >/dev/null 2>&1
+BODY_A=$(api POST /api/v1/employees "$TOK_ADMIN" "{\"masterId\":$EMP_B}" "Idempotency-Key: e2e-778-$E2E_TS")
+docker restart motiva-api-1 >/dev/null 2>&1 || fail "api-1 restart failed"
 sleep 3
 await "$LB/health/ready" 200 30 || fail "API restart: not ready"
-BODY_B=$(api POST /api/v1/employees "$TOK_ADMIN" '{"masterId":778}' "Idempotency-Key: e2e-778")
+BODY_B=$(api POST /api/v1/employees "$TOK_ADMIN" "{\"masterId\":$EMP_B}" "Idempotency-Key: e2e-778-$E2E_TS")
 [ "$BODY_A" = "$BODY_B" ] && pass "idempotent replay identical after API restart" || fail "replay body changed across restart"
 
 # ---------------------------------------------------------------- full business vertical through LB
@@ -71,10 +76,10 @@ VER=$(curl -s -D- -o /dev/null "$LB/api/v1/campaigns/$CID" -H "Authorization: Be
 api PATCH "/api/v1/campaigns/$CID" "$TOK_ADMIN" '{"status":"Published"}' "If-Match: $VER" >/dev/null
 api POST "/api/v1/campaigns/$CID/budget-allocations" "$TOK_ADMIN" "{\"resourceId\":\"$RID\",\"amount\":100,\"operationNumber\":\"$CODE-b\"}" >/dev/null
 api POST /api/v1/integration-grants "$TOK_ADMIN" "{\"subject\":\"progress-source\",\"kind\":\"Progress\",\"campaignId\":\"$CID\"}" "Idempotency-Key: $CODE-g" >/dev/null
-EV=$(api POST /api/v1/progress-events "$TOK_SRC" "{\"eventNumber\":\"$CODE-e1\",\"masterId\":777,\"taskId\":\"$TID\",\"delta\":2}")
-WALLET=$(api GET /api/v1/employees/777/wallet "$TOK_ADMIN" | jsonget "['balances'] and next(b['balance'] for b in d['balances'] if b['resourceCode']=='$CODE-R')")
+EV=$(api POST /api/v1/progress-events "$TOK_SRC" "{\"eventNumber\":\"$CODE-e1\",\"masterId\":$EMP_A,\"taskId\":\"$TID\",\"delta\":2}")
+WALLET=$(api GET /api/v1/employees/$EMP_A/wallet "$TOK_ADMIN" | jsonget "['balances'] and next(b['balance'] for b in d['balances'] if b['resourceCode']=='$CODE-R')")
 [ "$WALLET" = "4" ] && pass "event through LB: wallet credited" || fail "wallet balance after event: $WALLET (expected 4)"
-EV2=$(api POST /api/v1/progress-events "$TOK_SRC" "{\"eventNumber\":\"$CODE-e1\",\"masterId\":777,\"taskId\":\"$TID\",\"delta\":2}")
+EV2=$(api POST /api/v1/progress-events "$TOK_SRC" "{\"eventNumber\":\"$CODE-e1\",\"masterId\":$EMP_A,\"taskId\":\"$TID\",\"delta\":2}")
 [ "$EV" = "$EV2" ] && pass "progress replay byte-identical" || fail "progress replay differs"
 
 # ---------------------------------------------------------------- finalization by workers (<=5s SLO)
@@ -89,7 +94,7 @@ CHID2=$(api POST "/api/v1/campaigns/$CID2/challenges" "$TOK_ADMIN" "{\"streamId\
 VER2=$(curl -s -D- -o /dev/null "$LB/api/v1/campaigns/$CID2" -H "Authorization: Bearer $TOK_ADMIN" | grep -i '^etag' | tr -d '\r' | sed 's/.*: //')
 api PATCH "/api/v1/campaigns/$CID2" "$TOK_ADMIN" '{"status":"Published"}' "If-Match: $VER2" >/dev/null
 api POST /api/v1/integration-grants "$TOK_ADMIN" "{\"subject\":\"progress-source\",\"kind\":\"Progress\",\"campaignId\":\"$CID2\"}" "Idempotency-Key: $CODE2-g" >/dev/null
-api POST /api/v1/progress-events "$TOK_SRC" "{\"eventNumber\":\"$CODE2-e\",\"masterId\":777,\"taskId\":\"$TID2\",\"delta\":3}" >/dev/null
+api POST /api/v1/progress-events "$TOK_SRC" "{\"eventNumber\":\"$CODE2-e\",\"masterId\":$EMP_A,\"taskId\":\"$TID2\",\"delta\":3}" >/dev/null
 START=$(date +%s)
 STATE=""
 while [ $(( $(date +%s) - START )) -lt 15 ]; do
@@ -116,14 +121,14 @@ docker compose unpause valkey >/dev/null
 
 # ---------------------------------------------------------------- degradation: one API down
 note "T3-19: one API replica down 10s -> LB keeps serving"
-docker compose stop api-2 >/dev/null 2>&1
+docker stop motiva-api-2 >/dev/null 2>&1 || fail "api-2 stop failed"
 sleep 2
 OK=0
 for i in $(seq 1 10); do
   CODE3=$(curl -s -o /dev/null -w "%{http_code}" "$LB/health/ready")
   [ "$CODE3" = "200" ] && OK=$((OK + 1))
 done
-docker compose start api-2 >/dev/null 2>&1
+docker start motiva-api-2 >/dev/null 2>&1 || fail "api-2 start failed"
 sleep 5
 await "$LB/health/ready" 200 30
 [ "$OK" -ge 8 ] && pass "service survived with one API replica ($OK/10 requests ok)" || fail "availability with one API down: $OK/10"
@@ -142,7 +147,7 @@ await "$LB/health/ready" 200 60 || fail "readiness did not recover after PG rest
 [ "$R_STATUS" = "503" ] && pass "readiness reports 503 during PG outage" || fail "readiness during PG outage: $R_STATUS"
 [ -n "$RETRY_AFTER" ] && pass "economic write returns 503 with Retry-After" || fail "no Retry-After on 503"
 # No duplicate effects: the replayed event stays identical after recovery.
-EV3=$(api POST /api/v1/progress-events "$TOK_SRC" "{\"eventNumber\":\"$CODE-e1\",\"masterId\":777,\"taskId\":\"$TID\",\"delta\":2}")
+EV3=$(api POST /api/v1/progress-events "$TOK_SRC" "{\"eventNumber\":\"$CODE-e1\",\"masterId\":$EMP_A,\"taskId\":\"$TID\",\"delta\":2}")
 [ "$EV" = "$EV3" ] && pass "no duplicate effects after PG recovery" || fail "replay changed after PG recovery"
 
 # ---------------------------------------------------------------- export lifecycle with workers
@@ -172,7 +177,7 @@ fi
 note "T3-19: S3 outage -> main flow unaffected, link issue -> 424/409"
 docker compose stop s3 >/dev/null
 sleep 2
-EV4_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$LB/api/v1/progress-events" -H "Authorization: Bearer $TOK_SRC" -H "Content-Type: application/json" -d "{\"eventNumber\":\"$CODE-e2\",\"masterId\":777,\"taskId\":\"$TID\",\"delta\":1}")
+EV4_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$LB/api/v1/progress-events" -H "Authorization: Bearer $TOK_SRC" -H "Content-Type: application/json" -d "{\"eventNumber\":\"$CODE-e2\",\"masterId\":$EMP_A,\"taskId\":\"$TID\",\"delta\":1}")
 LINK_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 -X POST "$LB/api/v1/exports/$EID/download-links" -H "Authorization: Bearer $TOK_EMP" -H "Idempotency-Key: $CODE-l3" | head -c 3)
 docker compose start s3 >/dev/null
 [ "$EV4_STATUS" = "201" ] && pass "progress accounting unaffected by S3 outage" || fail "progress failed during S3 outage: $EV4_STATUS"

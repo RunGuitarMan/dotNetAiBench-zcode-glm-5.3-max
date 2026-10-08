@@ -9,6 +9,7 @@ namespace Motiva.Application.Budgets;
 /// while the campaign is Draft/Published and its window/season has not ended; every allocation
 /// is an operation in the history; replay by number is exact (B24).</summary>
 public sealed class BudgetService(
+    CurrentRights rights,
     ICampaignCatalog campaigns,
     IResourceDirectory resources,
     IBudgetLedger budgets,
@@ -20,7 +21,7 @@ public sealed class BudgetService(
     public async Task<CommandResponse> AllocateAsync(
         ActorContext actor, Guid campaignId, Guid resourceId, long amount, string? reason, string operationNumber, CancellationToken ct)
     {
-        Authz.EnsureAdmin(actor);
+        await rights.EnsureAdminAsync(actor, ct);
         Guard.ExternalNumber(operationNumber);
         Guard.PositiveAmount(amount);
         Guard.Description(reason);
