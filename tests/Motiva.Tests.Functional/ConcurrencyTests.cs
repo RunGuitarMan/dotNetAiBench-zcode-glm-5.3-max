@@ -115,7 +115,7 @@ public sealed class ConcurrencyTests(MotivaFunctionalFixture fixture)
         var taskAId = TestWorld.ParseJson(taskA.Body).GetProperty("id").GetString()!;
         var taskBId = TestWorld.ParseJson(taskB.Body).GetProperty("id").GetString()!;
 
-        await content.CreateMilestoneAsync(world.Admin, Guid.Parse(streamId), 10, x, "ms-10", CancellationToken.None);        await content.CreateMilestoneAsync(world.Admin, Guid.Parse(streamId), 20, x, "ms-20", CancellationToken.None);
+        await content.CreateMilestoneAsync(world.Admin, Guid.Parse(streamId), 10, x, "ms-10", CancellationToken.None); await content.CreateMilestoneAsync(world.Admin, Guid.Parse(streamId), 20, x, "ms-20", CancellationToken.None);
         var current = await campaigns.GetAsync(world.Admin, Guid.Parse(campaignId), CancellationToken.None);
         await campaigns.PatchAsync(world.Admin, Guid.Parse(campaignId), ETags.Format(current.Version), null, null, null,
             Motiva.Application.Ports.CampaignStatus.Published, CancellationToken.None);
